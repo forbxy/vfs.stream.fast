@@ -1,0 +1,34 @@
+# Kodi Media Center language file
+# Addon Name: vfs.stream.fast
+# Addon id: vfs.stream.fast
+# Addon Provider: hezi
+msgid ""
+msgstr ""
+
+msgctxt "#30001"
+msgid "Cache Settings"
+msgstr "Cache Settings"
+
+msgctxt "#30002"
+msgid "Head Cache Size (MB)"
+msgstr "Head Cache Size (MB)"
+
+msgctxt "#30003"
+msgid "Tail Cache Size (MB)"
+msgstr "Tail Cache Size (MB)"
+
+msgctxt "#30004"
+msgid "Middle (JIT) Cache Size (MB)"
+msgstr "Middle (JIT) Cache Size (MB)"
+
+msgctxt "#30005"
+msgid "Read-Ahead Buffer Size (MB)"
+msgstr "Read-Ahead Buffer Size (MB)"
+
+msgctxt "#30006"
+msgid "Played Data Buffer Size (MB)"
+msgstr "Played Data Buffer Size (MB)"
+
+msgctxt "#30007"
+msgid "Min File Size to Preload (GB)"
+msgstr "Min File Size to Preload (GB)"

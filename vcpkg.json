@@ -1,0 +1,20 @@
+{
+  "name": "vfs-stream-fast",
+  "version-string": "1.0.0",
+  "builtin-baseline": "aebdcca3833a60ad33e4ce848437eee434669ed4", 
+  "dependencies": [
+    {
+      "name": "curl",
+      "features": [
+        "ssl",
+        "http2"
+      ]
+    }
+  ],
+  "overrides": [
+    {
+      "name": "curl",
+      "version": "8.8.0"
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<addon id="vfs.stream.fast"
+       version="1.0.0"
+       name="Fast Stream VFS"
+       provider-name="forbxy">
+  
+  <requires>
+    <import addon="kodi.binary.global.main" version="2.0.2"/>
+    <import addon="kodi.binary.instance.vfs" version="3.0.1"/>
+  </requires>
+
+  <!-- 
+    核心配置：
+    protocols: 我们接管 dav, davs (WebDAV) 以及 http, https
+    files="true": 我们负责文件读取（这是我们加速的地方）
+    directories="false": 我们不负责目录列表（让 Kodi 内部的 CDAVDirectory 继续工作，省去了解析 XML 的麻烦）
+  -->
+  <extension point="kodi.vfs"
+             files="true"
+             directories="false"
+             protocols="dav|davs|http|https"
+             library_windows="vfs.stream.fast.dll"
+             library_linux="libvfs.stream.fast.so"
+             library_android="libvfs.stream.fast.so"/>
+
+  <extension point="xbmc.addon.metadata">
+    <platform>all</platform>
+    <summary lang="zh_CN">高性能流媒体加速器</summary>
+    <description lang="zh_CN">提前缓存文件头尾做内存响应，解决kodi无法播放网络链接ISO文件的问题</description>
+    <assets>
+      <!-- <icon>icon.png</icon> -->
+    </assets>
+  </extension>
+</addon>

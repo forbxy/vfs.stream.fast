@@ -1,0 +1,157 @@
+name: Build VFS Addon
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- Android (Cross Compile) ---
+          - os: android
+            arch: arm64-v8a
+            runs-on: ubuntu-latest
+            triplet: arm64-android
+            cmake-args: -DCMAKE_SYSTEM_NAME=Android -DCMAKE_SYSTEM_VERSION=28 -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a -DCMAKE_ANDROID_NDK=$ANDROID_NDK_HOME
+          
+          - os: android
+            arch: armeabi-v7a
+            runs-on: ubuntu-latest
+            triplet: arm-neon-android
+            cmake-args: -DCMAKE_SYSTEM_NAME=Android -DCMAKE_SYSTEM_VERSION=28 -DCMAKE_ANDROID_ARCH_ABI=armeabi-v7a -DCMAKE_ANDROID_NDK=$ANDROID_NDK_HOME
+
+          # --- Windows ---
+          - os: windows
+            arch: x64
+            runs-on: windows-latest
+            triplet: x64-windows-static
+            cmake-args: -A x64
+
+          - os: windows
+            arch: x86
+            runs-on: windows-latest
+            triplet: x86-windows-static
+            cmake-args: -A Win32
+
+          # --- Linux (Ubuntu) ---
+          - os: linux
+            arch: x64
+            runs-on: ubuntu-latest
+            triplet: x64-linux
+            cmake-args: ""
+
+          - os: linux
+            arch: x86
+            runs-on: ubuntu-latest
+            triplet: x86-linux
+            cmake-args: -DCMAKE_CXX_FLAGS="-m32" -DCMAKE_C_FLAGS="-m32"
+
+          - os: linux
+            arch: arm64
+            runs-on: ubuntu-latest
+            triplet: arm64-linux
+            cmake-args: -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
+
+          - os: linux
+            arch: arm32
+            runs-on: ubuntu-latest
+            triplet: arm-linux
+            cmake-args: -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=arm -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. 下载 Kodi 源码 (为了头文件)
+      - name: Checkout Kodi Source
+        uses: actions/checkout@v4
+        with:
+          repository: xbmc/xbmc
+          ref: Omega  # 建议改为 Omega (Kodi 21) 以获得最佳兼容性
+          path: kodi_src
+          fetch-depth: 1
+
+      # 2. 安装 vcpkg (全平台)
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'aebdcca3833a60ad33e4ce848437eee434669ed4' # 锁定为 2026-01-10 版本
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      # 3. 安装依赖 (Linux 基础环境)
+      - name: Install Linux Build Tools
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ pkg-config build-essential
+          if [ "${{ matrix.arch }}" == "x86" ]; then
+            sudo apt-get install -y gcc-multilib g++-multilib
+          fi
+          if [ "${{ matrix.arch }}" == "arm64" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          fi
+          if [ "${{ matrix.arch }}" == "arm32" ]; then
+            sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+          fi
+
+      # 4. 编译 (全平台统一使用 vcpkg 清单模式)
+      # 即使是 Linux，也使用 vcpkg 编译 release 版的 curl，确保全平台 libcurl 版本完全一致
+      - name: Configure and Build (Manifest Mode)
+        shell: bash
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_TOOLCHAIN_FILE=vcpkg/scripts/buildsystems/vcpkg.cmake \
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
+            -DKODI_SOURCE_DIR=kodi_src \
+            ${{ matrix.cmake-args }}
+          cmake --build build --config Release
+
+      # 5. 编译 (Linux 原生) - REMOVED (Merged into Step 4)
+
+      # 6. 打包文件 (整理输出)
+      - name: Prepare Artifacts
+        shell: bash
+        run: |
+          # 提取版本号 (使用更兼容的 grep 或者 sed)
+          # Windows Git Bash 中的 grep -P 有时会遇到 Locale 问题
+          VERSION=$(grep 'version="' addon.xml | head -1 | sed -n 's/.*version="\([^"]*\)".*/\1/p')
+          echo "Detected version: $VERSION"
+          
+          ADDON_ID="vfs.stream.fast"
+          mkdir -p $ADDON_ID
+          
+          # 复制 addon.xml
+          cp addon.xml $ADDON_ID/
+
+          # 复制 resources 目录
+          cp -r resources $ADDON_ID/
+
+          # ------------------------------------------------------------------
+          # 动态修改 addon.xml 中的平台标识 (Platform) - 已禁用
+          # 保持 <platform>all</platform>，避免在某些系统(如CE)上因平台标识不匹配导致无法安装
+          # ------------------------------------------------------------------
+          
+          # 复制并重命名二进制文件 (Kodi 需要特定的文件名)
+          if [ "${{ matrix.os }}" == "windows" ]; then
+            find build -name "*.dll" -exec cp {} $ADDON_ID/$ADDON_ID.dll \;
+          else
+            # Linux/Android 通常是 libvfs.stream.fast.so
+            find build -name "*.so" -exec cp {} $ADDON_ID/lib$ADDON_ID.so \;
+          fi
+          
+          # 准备上传目录 (避免二次压缩)
+          # 将最终文件夹移动到 staging 目录，这样 upload-artifact 上传 staging 时会自动将该文件夹放在 zip 根目录
+          mkdir -p staging
+          mv $ADDON_ID staging/
+          
+          # 导出版本号供下一步骤使用
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          # 最终产物名称: vfs.stream.fast-1.0.0-windows-x64.zip
+          name: vfs.stream.fast-${{ env.VERSION }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: staging/

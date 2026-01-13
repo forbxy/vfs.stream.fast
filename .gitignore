@@ -1,0 +1,47 @@
+# CMake
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake
+!CMakeLists.txt
+
+# Visual Studio / MSVC
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.user
+*.vcxproj.filters
+*.user
+*.suo
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.dll
+*.exp
+idb/
+
+# Visual Studio Code
+.vscode/
+
+# Output directories
+bin/
+lib/
+out/
+
+# Python (if any scripts are used)
+__pycache__/
+*.pyc
+
+# System
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Vcpkg
+vcpkg_installed/
+
+# Kodi Addon specific
+*.zip
