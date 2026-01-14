@@ -50,7 +50,7 @@ public:
     size_t m_cfg_middle_size = 20 * 1024 * 1024;  // 中间热点(JIT)缓存大小
     size_t m_cfg_ring_size = 100 * 1024 * 1024;   // 主 RingBuffer 大小
     size_t m_cfg_history_size = 10 * 1024 * 1024; // 保留历史数据大小
-    int64_t m_cfg_preload_thresh = 10 * 1024 * 1024 * 1024;   // <10GB 跳过预热(Preload Head/Tail)
+    int64_t m_cfg_preload_thresh = 10LL * 1024 * 1024 * 1024;   // <10GB 跳过预热(Preload Head/Tail)
 
 protected:
     // 工作线程入口
