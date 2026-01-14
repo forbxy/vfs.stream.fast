@@ -1496,7 +1496,7 @@ int64_t CCurlBuffer::Seek(int64_t position, int whence)
     if (m_total_size > 0 && target_pos > m_total_size)
         target_pos = m_total_size;
 
-    // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Seek() 请求 %lld (模式: %d). 更新逻辑位置 (原: %lld).", target_pos, whence, m_logical_position);
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Seek() 请求 %lld (模式: %d). 更新逻辑位置 (原: %lld).", target_pos, whence, m_logical_position);
 
     m_logical_position = target_pos; 
 
