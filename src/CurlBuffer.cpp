@@ -998,6 +998,10 @@ void CCurlBuffer::WorkerThread()
 
         if (res == CURLE_OK)
         {
+            // [Fix] 成功完成一次传输（或者正常EOF），应该清零重试计数器
+            // 否则在不稳定的网络下，多次的小中断累积起来会导致误判为"彻底没救"
+            retries = 0;
+
             // 正常结束，这通常意味着下载完了 (EOF)
             // 虽然我们在 Step 2 检查 EOF，但这里作为防御
             m_is_eof = true;
