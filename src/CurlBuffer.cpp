@@ -1117,6 +1117,24 @@ size_t CCurlBuffer::HandleWrite(void *contents, size_t size)
 
     std::unique_lock<std::mutex> lock(m_ring_buffer_mutex);
 
+    // [New] 更新累计下载并检查阈值
+    // 阈值规则: max(头部+尾部+JIT, 500MB)
+    // 注意：只要 m_disable_static_caches 变成 true，就不再变回去
+    if (!m_disable_static_caches)
+    {
+        m_accumulated_download_bytes += size;
+        
+        // 计算阈值 (动态计算避免初始化顺序问题，且开销极小)
+        int64_t threshold = std::max((size_t)(500 * 1024 * 1024), m_cfg_head_size + m_cfg_tail_size + m_cfg_middle_size);
+        
+        if (m_accumulated_download_bytes > threshold)
+        {
+            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 累计下载超过阈值 (%lld > %lld). 屏蔽静态缓存.", 
+                (int64_t)m_accumulated_download_bytes, threshold);
+            m_disable_static_caches = true;
+        }
+    }
+
     // ---------------------------------------------------------
     // 常规写入环形缓冲区 (Ring Buffer Write Only)
     // ---------------------------------------------------------
@@ -1191,123 +1209,127 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
     // ---------------------------------------------------------
     // 1. 优先检查静态缓存 (Static Caches) - 全命中策略
     // ---------------------------------------------------------
-    // A. 头部缓存 (Head Cache)
-    if (m_logical_position < (int64_t)m_head_valid_length)
+    // [New] 超过一定下载量后屏蔽静态缓存，防止大数偏移错误或干扰顺序播放
+    if (!m_disable_static_caches)
     {
-        // 计算实际需要提供的数据量 (处理 EOF 情况)
-        size_t available_in_cache = (size_t)(m_head_valid_length - m_logical_position);
-        size_t effective_request = size;
-        
-        // 如果文件很小，请求超出了总大小，我们将请求截断到 EOF，这样也算是"完全命中"
-        if (m_total_size > 0 && m_logical_position + (int64_t)size > m_total_size)
+        // A. 头部缓存 (Head Cache)
+        if (m_logical_position < (int64_t)m_head_valid_length)
         {
-            effective_request = (size_t)(m_total_size - m_logical_position);
-        }
-
-        // 只有当缓存包含所有"有效"请求数据时才命中
-        if (effective_request <= available_in_cache)
-        {
-            memcpy(buffer, m_head_buffer->data() + m_logical_position, effective_request);
-
-            // [防御性编程] 处理 Short Read 的清零
-            if (effective_request < size)
+            // 计算实际需要提供的数据量 (处理 EOF 情况)
+            size_t available_in_cache = (size_t)(m_head_valid_length - m_logical_position);
+            size_t effective_request = size;
+            
+            // 如果文件很小，请求超出了总大小，我们将请求截断到 EOF，这样也算是"完全命中"
+            if (m_total_size > 0 && m_logical_position + (int64_t)size > m_total_size)
             {
-                memset(buffer + effective_request, 0, size - effective_request);
+                effective_request = (size_t)(m_total_size - m_logical_position);
             }
 
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 完全命中头部缓存. Pos: %lld, Req: %zu, Actual: %zu", m_logical_position, size, effective_request);
-            m_logical_position += effective_request;
-            return effective_request;
-        }
-    }
-    // B. 尾部缓存 (Tail Cache)
-    else if (m_total_size > 0 && m_tail_valid_from != -1 && m_logical_position >= m_tail_valid_from)
-    {
-        // int64_t tail_start = m_total_size - m_tail_buffer->size(); 
-        // [Fix] 直接使用 m_tail_valid_from 作为基准，不再重新计算 tail_start
-        // 因为如果 DownloadRange 发生了 Short Read 导致 buffer resize，重新计算会导致偏移错误
-        {
-            // [Fix] 32-bit Overflow Fix
-            int64_t diff = m_logical_position - m_tail_valid_from;
-            
-            // 只要 offset 在缓存范围内，我们就拥有直到 EOF 的所有数据。
-            if (diff >= 0 && diff < (int64_t)m_tail_buffer->size())
+            // 只有当缓存包含所有"有效"请求数据时才命中
+            if (effective_request <= available_in_cache)
             {
-                size_t offset = (size_t)diff;
-                size_t bytes_left_in_cache = m_tail_buffer->size() - offset;
-                size_t to_copy = std::min(size, bytes_left_in_cache);
+                memcpy(buffer, m_head_buffer->data() + m_logical_position, effective_request);
 
-                memcpy(buffer, m_tail_buffer->data() + offset, to_copy);
-
-                // [防御性编程] 如果读不满(到了EOF)，将剩余buffer清零，给个"干净的标记"
-                if (to_copy < size)
+                // [防御性编程] 处理 Short Read 的清零
+                if (effective_request < size)
                 {
-                    memset(buffer + to_copy, 0, size - to_copy);
+                    memset(buffer + effective_request, 0, size - effective_request);
                 }
 
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 完全命中尾部缓存. Pos: %lld, Req: %zu, Actual: %zu%s", 
-                    m_logical_position, size, to_copy, (to_copy < size ? " (EOF)" : ""));
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 完全命中头部缓存. Pos: %lld, Req: %zu, Actual: %zu", m_logical_position, size, effective_request);
+                m_logical_position += effective_request;
+                return effective_request;
+            }
+        }
+        // B. 尾部缓存 (Tail Cache)
+        else if (m_total_size > 0 && m_tail_valid_from != -1 && m_logical_position >= m_tail_valid_from)
+        {
+            // int64_t tail_start = m_total_size - m_tail_buffer->size(); 
+            // [Fix] 直接使用 m_tail_valid_from 作为基准，不再重新计算 tail_start
+            // 因为如果 DownloadRange 发生了 Short Read 导致 buffer resize，重新计算会导致偏移错误
+            {
+                // [Fix] 32-bit Overflow Fix
+                int64_t diff = m_logical_position - m_tail_valid_from;
                 
+                // 只要 offset 在缓存范围内，我们就拥有直到 EOF 的所有数据。
+                if (diff >= 0 && diff < (int64_t)m_tail_buffer->size())
+                {
+                    size_t offset = (size_t)diff;
+                    size_t bytes_left_in_cache = m_tail_buffer->size() - offset;
+                    size_t to_copy = std::min(size, bytes_left_in_cache);
+
+                    memcpy(buffer, m_tail_buffer->data() + offset, to_copy);
+
+                    // [防御性编程] 如果读不满(到了EOF)，将剩余buffer清零，给个"干净的标记"
+                    if (to_copy < size)
+                    {
+                        memset(buffer + to_copy, 0, size - to_copy);
+                    }
+
+                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 完全命中尾部缓存. Pos: %lld, Req: %zu, Actual: %zu%s", 
+                        m_logical_position, size, to_copy, (to_copy < size ? " (EOF)" : ""));
+                    
+                    m_logical_position += to_copy;
+                    return to_copy;
+                }
+            }
+        }
+
+        // ---------------------------------------------------------
+        // C. 如果头尾缓存都未命中，但kodi还是解析ISO，这就是最后的解药。
+        // 中间热点缓存 (JIT Middle Cache) - 针对 ISO 菜单等随机读取优化
+        // ---------------------------------------------------------
+        
+        // 如果 Worker 未运行，且确实需要使用热点缓存（非顺序读取，或者强制使用）
+        if (!m_worker_thread.joinable())
+        {
+            // 尝试获取或创建 JIT Cache
+            // CreateMiddleCache 内部会检查是否已存在有效的覆盖
+            // 注意：原本只针对 Random Seek，现在根据指示，对于 !Worker 的情况直接依赖 JIT
+            if (!CreateMiddleCache(m_logical_position))
+            {
+                kodi::Log(ADDON_LOG_ERROR, "FastVFS: CreateMiddleCache 下载失败，Read 终止.");
+                return -1;
+            }
+        }
+
+        // 尝试从 JIT 缓存读取 (CreateMiddleCache 成功后，这里一定会命中，除非 Cache 大小设计问题)
+        if (m_middle_valid_from != -1 && m_logical_position >= m_middle_valid_from)
+        {
+            // [Fix] 32-bit Overflow Fix
+            int64_t diff = m_logical_position - m_middle_valid_from;
+            
+            if (diff >= 0 && diff < (int64_t)m_middle_buffer->size())
+            {
+                size_t offset = (size_t)diff;
+                size_t bytes_left_in_cache = m_middle_buffer->size() - offset;
+                size_t to_copy = std::min(size, bytes_left_in_cache);
+
+                memcpy(buffer, m_middle_buffer->data() + offset, to_copy);
+                
+                // [防御性编程]
+                if (to_copy < size)
+                    memset(buffer + to_copy, 0, size - to_copy);
+
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 命中JIT热点缓存. Pos: %lld, Req: %zu, Actual: %zu", m_logical_position, size, to_copy);
                 m_logical_position += to_copy;
+
+                // [JIT 接力机制]
+                // 如果读取进度超过了热点缓存的一半，且 Worker 未启动，说明这可能是一个连续播放行为
+                // 提前启动 Worker，实现无缝衔接 (虽然可能重复下载一小段热点缓存中剩余的数据，但保证了逻辑简单连续)
+                // [优化] 只有当 JIT 缓存没有覆盖到文件末尾时才启动 Worker。如果 JIT 已经包含 EOF，直接用 JIT 读完即可。
+                bool is_covered_to_eof = (m_total_size > 0 && (m_middle_valid_from + (int64_t)m_middle_buffer->size() >= m_total_size));
+
+                if (!m_worker_thread.joinable() && !is_covered_to_eof && offset > m_middle_buffer->size() / 2)
+                {
+                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 检测到连续读取 (Offset: %zu > Half), 提前启动 Worker 接力.", offset);
+                    StartWorker();
+                }
+
                 return to_copy;
             }
         }
-    }
-
-    // ---------------------------------------------------------
-    // C. 如果头尾缓存都未命中，但kodi还是解析ISO，这就是最后的解药。
-    // 中间热点缓存 (JIT Middle Cache) - 针对 ISO 菜单等随机读取优化
-    // ---------------------------------------------------------
-    
-    // 如果 Worker 未运行，且确实需要使用热点缓存（非顺序读取，或者强制使用）
-   if (!m_worker_thread.joinable())
-    {
-        // 尝试获取或创建 JIT Cache
-        // CreateMiddleCache 内部会检查是否已存在有效的覆盖
-        // 注意：原本只针对 Random Seek，现在根据指示，对于 !Worker 的情况直接依赖 JIT
-        if (!CreateMiddleCache(m_logical_position))
-        {
-             kodi::Log(ADDON_LOG_ERROR, "FastVFS: CreateMiddleCache 下载失败，Read 终止.");
-             return -1;
-        }
-    }
-
-    // 尝试从 JIT 缓存读取 (CreateMiddleCache 成功后，这里一定会命中，除非 Cache 大小设计问题)
-    if (m_middle_valid_from != -1 && m_logical_position >= m_middle_valid_from)
-    {
-        // [Fix] 32-bit Overflow Fix
-        int64_t diff = m_logical_position - m_middle_valid_from;
-        
-        if (diff >= 0 && diff < (int64_t)m_middle_buffer->size())
-        {
-            size_t offset = (size_t)diff;
-            size_t bytes_left_in_cache = m_middle_buffer->size() - offset;
-            size_t to_copy = std::min(size, bytes_left_in_cache);
-
-            memcpy(buffer, m_middle_buffer->data() + offset, to_copy);
-            
-             // [防御性编程]
-            if (to_copy < size)
-                memset(buffer + to_copy, 0, size - to_copy);
-
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 命中JIT热点缓存. Pos: %lld, Req: %zu, Actual: %zu", m_logical_position, size, to_copy);
-            m_logical_position += to_copy;
-
-            // [JIT 接力机制]
-            // 如果读取进度超过了热点缓存的一半，且 Worker 未启动，说明这可能是一个连续播放行为
-            // 提前启动 Worker，实现无缝衔接 (虽然可能重复下载一小段热点缓存中剩余的数据，但保证了逻辑简单连续)
-            // [优化] 只有当 JIT 缓存没有覆盖到文件末尾时才启动 Worker。如果 JIT 已经包含 EOF，直接用 JIT 读完即可。
-            bool is_covered_to_eof = (m_total_size > 0 && (m_middle_valid_from + (int64_t)m_middle_buffer->size() >= m_total_size));
-
-            if (!m_worker_thread.joinable() && !is_covered_to_eof && offset > m_middle_buffer->size() / 2)
-            {
-                 kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 检测到连续读取 (Offset: %zu > Half), 提前启动 Worker 接力.", offset);
-                 StartWorker();
-            }
-
-            return to_copy;
-        }
-    }
+    } // End of m_disable_static_caches check
 
     // ---------------------------------------------------------
     // 延迟初始化 (Lazy Init)

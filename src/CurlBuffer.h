@@ -52,6 +52,10 @@ public:
     size_t m_cfg_history_size = 10 * 1024 * 1024; // 保留历史数据大小
     int64_t m_cfg_preload_thresh = 10LL * 1024 * 1024 * 1024;   // <10GB 跳过预热(Preload Head/Tail)
 
+    // [New] 动态缓存屏蔽阈值
+    std::atomic<bool> m_disable_static_caches{false};
+    std::atomic<int64_t> m_accumulated_download_bytes{0};
+
 protected:
     // 工作线程入口
     void WorkerThread();
