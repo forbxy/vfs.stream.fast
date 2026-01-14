@@ -78,11 +78,15 @@ if(WIN32)
     target_compile_definitions(${PROJECT_NAME} PRIVATE TARGET_WINDOWS)
 elseif(ANDROID)
     target_compile_definitions(${PROJECT_NAME} PRIVATE TARGET_ANDROID)
+    # Ensure Large File Support on 32-bit Android
+    target_compile_definitions(${PROJECT_NAME} PRIVATE -D_FILE_OFFSET_BITS=64)
     target_link_libraries(${PROJECT_NAME} PRIVATE log) # Link Android Log
     # Release 模式下去除符号表，减小体积
     target_link_options(${PROJECT_NAME} PRIVATE $<$<CONFIG:Release>:-s>)
 elseif(UNIX AND NOT APPLE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE TARGET_LINUX)
+    # Ensure Large File Support on 32-bit Linux
+    target_compile_definitions(${PROJECT_NAME} PRIVATE -D_FILE_OFFSET_BITS=64)
     # Release 模式下去除符号表，减小体积
     target_link_options(${PROJECT_NAME} PRIVATE $<$<CONFIG:Release>:-s>)
 endif()

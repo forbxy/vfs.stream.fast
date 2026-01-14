@@ -1223,12 +1223,13 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
         // [Fix] 直接使用 m_tail_valid_from 作为基准，不再重新计算 tail_start
         // 因为如果 DownloadRange 发生了 Short Read 导致 buffer resize，重新计算会导致偏移错误
         {
-            size_t offset = (size_t)(m_logical_position - m_tail_valid_from);
+            // [Fix] 32-bit Overflow Fix
+            int64_t diff = m_logical_position - m_tail_valid_from;
             
             // 只要 offset 在缓存范围内，我们就拥有直到 EOF 的所有数据。
-            // 无论请求多大，只要它起始于此，这就是一次"完全命中"(对于文件内容而言)
-            if (offset < m_tail_buffer->size())
+            if (diff >= 0 && diff < (int64_t)m_tail_buffer->size())
             {
+                size_t offset = (size_t)diff;
                 size_t bytes_left_in_cache = m_tail_buffer->size() - offset;
                 size_t to_copy = std::min(size, bytes_left_in_cache);
 
@@ -1270,9 +1271,12 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
     // 尝试从 JIT 缓存读取 (CreateMiddleCache 成功后，这里一定会命中，除非 Cache 大小设计问题)
     if (m_middle_valid_from != -1 && m_logical_position >= m_middle_valid_from)
     {
-        size_t offset = (size_t)(m_logical_position - m_middle_valid_from);
-        if (offset < m_middle_buffer->size())
+        // [Fix] 32-bit Overflow Fix
+        int64_t diff = m_logical_position - m_middle_valid_from;
+        
+        if (diff >= 0 && diff < (int64_t)m_middle_buffer->size())
         {
+            size_t offset = (size_t)diff;
             size_t bytes_left_in_cache = m_middle_buffer->size() - offset;
             size_t to_copy = std::min(size, bytes_left_in_cache);
 

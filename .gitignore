@@ -45,3 +45,5 @@ vcpkg_installed/
 
 # Kodi Addon specific
 *.zip
+
+dev_temp/
