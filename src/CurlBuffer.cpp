@@ -973,8 +973,15 @@ void CCurlBuffer::WorkerThread()
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, WorkerProgressCallback);
         curl_easy_setopt(curl, CURLOPT_XFERINFODATA, this);
+        
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Worker 开始下载. Pos: %lld", m_download_position.load());
 
         CURLcode res = curl_easy_perform(curl);
+        
+        if (res != CURLE_OK)
+        {
+             kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Worker 下载结束 (Error/Aborted). Res: %d", res);
+        }
 
         // ---------------------------------------------------------
         // Update Redirect Cache
@@ -1031,6 +1038,7 @@ void CCurlBuffer::WorkerThread()
         }
     }
     
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Worker 线程退出.");
     ReturnCurlHandleToPool(curl);
 }
 
