@@ -106,7 +106,7 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
             -DKODI_SOURCE_DIR=kodi_src \
             ${{ matrix.cmake-args }}
-          cmake --build build --config Release
+          cmake --build build --config Release --parallel
 
       # 5. 编译 (Linux 原生) - REMOVED (Merged into Step 4)
 
