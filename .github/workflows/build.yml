@@ -114,9 +114,9 @@ jobs:
       - name: Prepare Artifacts
         shell: bash
         run: |
-          # 提取版本号 (使用更兼容的 grep 或者 sed)
-          # Windows Git Bash 中的 grep -P 有时会遇到 Locale 问题
-          VERSION=$(grep 'version="' addon.xml | head -1 | sed -n 's/.*version="\([^"]*\)".*/\1/p')
+          # 提取版本号 (排除第一行的 xml version)
+          # 使用 grep -v '<?xml' 过滤掉文件头，防止匹配到 xml 的版本 1.0
+          VERSION=$(grep 'version="' addon.xml | grep -v '<?xml' | head -1 | sed -n 's/.*version="\([^"]*\)".*/\1/p')
           echo "Detected version: $VERSION"
           
           ADDON_ID="vfs.stream.fast"
