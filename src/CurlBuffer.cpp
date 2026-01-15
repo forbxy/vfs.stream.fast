@@ -512,6 +512,40 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
 
                 final_size = content_length;
             }
+             // [Fix] 处理 403 Forbidden 情况 (某些网盘不接受 HEAD 请求)
+            // 回退策略: 尝试极小的 GET Range (bytes=0-1) 请求
+            else if (response_code == 403 || response_code == 405)
+            {
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat HEAD failed (%ld). Fallback to GET 0-1...", response_code);
+                
+                curl_easy_reset(curl);
+                SetupCurlOptions(curl, false); // 不是 HEAD
+                curl_easy_setopt(curl, CURLOPT_RANGE, "0-1"); 
+                // 不要 WriteCallback，只要头信息
+                 curl_easy_setopt(curl, CURLOPT_NOBODY, 0L); // 需要 Body
+                 curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](void* buffer, size_t size, size_t nmemb, void* userp) -> size_t {
+                    return size * nmemb; // 丢弃数据
+                });
+
+                res = curl_easy_perform(curl);
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+                
+                if (res == CURLE_OK && response_code == 206) {
+                     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Fallback GET Success. Code=206");
+                     
+                     // 此时 Content-Range 是必须的
+                     if (curl_easy_header(curl, "Content-Range", 0, CURLH_HEADER, -1, &h) == CURLHE_OK) {
+                         if (h && h->value) {
+                             std::string cr(h->value);
+                             auto pos = cr.find('/');
+                             if (pos != std::string::npos) {
+                                 try { final_size = std::stoll(cr.substr(pos + 1)); } catch(...) {}
+                             }
+                         }
+                     }
+                     m_support_range = true; // 能 206 就是支持
+                }
+            }
         }
     }
 
