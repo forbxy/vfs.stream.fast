@@ -101,6 +101,11 @@ static int DebugCallback(CURL *handle, curl_infotype type, char *data, size_t si
 
 static std::string GetUserAgent()
 {
+    // [User Request] 强制使用 Chrome User-Agent，旧代码保留
+    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+
+    /* 
+    // Old Kodi User-Agent Construction
     struct kodi_version_t ver;
     kodi::KodiVersion(ver);
     
@@ -120,6 +125,7 @@ static std::string GetUserAgent()
 
     result += " App_Bitness/64 Version/" + std::to_string(ver.major) + "." + std::to_string(ver.minor);
     return result;
+    */
 }
 
 // 简单的 Base64 编码实现 (避免依赖 kodi::tools 导致链接问题)
