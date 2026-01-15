@@ -10,7 +10,7 @@
 #include <map>
 
 // 定义一些常量
-static const int MAX_RETRIES = 5;
+static const int MAX_RETRIES = 10;
 static const int CONNECT_TIMEOUT = 10;
 static const int READ_TIMEOUT = 30;
 
@@ -1021,6 +1021,43 @@ void CCurlBuffer::WorkerThread()
         else
         {
             kodi::Log(ADDON_LOG_ERROR, "FastVFS: Curl 错误: %d. 重试 %d/%d", res, retries, MAX_RETRIES);
+
+            // [New] 发生错误时清除 302 缓存，确保重试时使用原始 URL
+            // 这可以防止因为 CDN 链接过期 (403/410) 或 IP 变动导致的持续错误
+            // 下一次 SetupCurlOptions 会重新解析，libcurl 会自动处理跳转并触发 UpdateRedirectCacheFromCurl 更新缓存
+            {
+                std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
+                g_redirect_cache.erase(m_file_url);
+            }
+
+            // [优化] 如果连接断开但缓冲区数据充足，先消耗缓冲区，避免立即重连
+            // 场景: 暂停很久 -> 服务器断连 -> Keepalive 发现报错 -> 此时 Buffer 可能是满的
+            // 如果立即重连，会因为 Buffer 满进入 HandleWrite 等待，导致新的连接又 Idle 很久再次被断
+            {
+               std::unique_lock<std::mutex> lock(m_ring_buffer_mutex);
+               // 阈值设定: 90% RingBuffer
+               // 注意: 设置为 90% 意味着只有缓冲非常满时才暂停重连。如果只想保持基本播放，可以调低比例。
+               size_t wait_threshold = (size_t)(m_ring_buffer_size * 0.9);
+               
+               if (m_rb_bytes_available > wait_threshold)
+               {
+                   kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 连接断开但缓冲充足 (%zu > %zu). 暂停重连...", m_rb_bytes_available, wait_threshold);
+                   
+                   // 挂起 Worker，直到:
+                   // 1. 缓冲区数据下降到阈值以下 (说明开始播放消耗了)
+                   // 2. 收到 Reset 信号 (用户拖动进度条)
+                   // 3. 插件停止
+                   m_cv_writer.wait(lock, [this, wait_threshold] { 
+                       return m_rb_bytes_available < wait_threshold || m_trigger_reset || !m_is_running; 
+                   });
+                   
+                   if (m_trigger_reset) 
+                       kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 暂停期间收到 Reset 信号，立即重连...");
+                   else if (m_is_running)
+                       kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 缓冲水位下降 (低于阈值)，恢复重连...");
+               }
+            }
+
             retries++;
             if (retries > MAX_RETRIES)
             {
@@ -1096,6 +1133,13 @@ void CCurlBuffer::SetupCurlOptions(CURL *curl, bool headOnly, int64_t startPos)
     }
 
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, CONNECT_TIMEOUT);
+
+    // [New] 启用 TCP Keepalive 防止僵尸连接及长暂停挂起
+    // 如果服务器默默掐掉连接 (Zombie Connection)，探测失败会报错返回，而不是导致 recv() 无限挂起
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 60L);  // 空闲 60s 后开始探测
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L); //每 30s 探测一次
+
     if (!headOnly)
     {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CCurlBuffer::WriteCallback);
