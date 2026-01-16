@@ -238,7 +238,11 @@ void CCurlBuffer::Close()
     // 3. 等待工作线程结束
     if (m_worker_thread.joinable())
     {
+        auto t0 = std::chrono::steady_clock::now();
         m_worker_thread.join();
+        auto t1 = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Worker join wait time: %lld ms", (long long)ms);
     }
 }
 
@@ -627,21 +631,26 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
             
              kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Success (%s). Size: %lld, Range: %d, Time: %lld, IsDir: %d", 
                  isWebDav ? "WebDAV" : "HTTP", final_size, m_support_range, (int64_t)m_mod_time, m_is_directory);
+             
+             // 成功结果总是已缓存
+             g_stat_cache[m_file_url] = entry;
         }
         else
         {
-            if (response_code == 404 || response_code == 410)
+            // [Fix] 仅明确的 404/410 才缓存 "Not Found"
+            // 不要缓存网络超时(28)、连接拒绝(7)或服务器内部错误(5xx)，以便下次重试
+            if (res == CURLE_OK && (response_code == 404 || response_code == 410))
             {
-               kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Failed (404/410). Code=%ld", response_code);
+               kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Failed (404/410). Code=%ld (Cached as Not Found)", response_code);
+               entry.exists = false;
+               g_stat_cache[m_file_url] = entry;
             }
             else
             {
-               kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat Error. CurCode=%d, HTTP=%ld", res, response_code);
+               kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat Error. CurCode=%d, HTTP=%ld (Not Cached, allowing retry)", res, response_code);
             }
-            entry.exists = false;
             success = false;
         }
-        g_stat_cache[m_file_url] = entry;
     }
 
     ReturnCurlHandleToPool(curl);
@@ -1322,9 +1331,15 @@ void CCurlBuffer::SetupCurlOptions(CURL *curl, bool headOnly, int64_t startPos)
 
     // [New] 启用 TCP Keepalive 防止僵尸连接及长暂停挂起
     // 如果服务器默默掐掉连接 (Zombie Connection)，探测失败会报错返回，而不是导致 recv() 无限挂起
+    // 缩短探测间隔以便更快发现僵尸连接/断开
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 60L);  // 空闲 60s 后开始探测
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L); //每 30s 探测一次
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 15L);  // 空闲 15s 后开始探测
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 5L);  // 每 5s 探测一次
+
+    // 如果连接在短时间内无数据，认为是“低速/挂起”并自动断开以加速重试/退出
+    // 这样在 Close() 时能更快触发 WorkerProgressCallback -> 中断 curl
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L); // bytes/second
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 10L); // seconds
 
     if (!headOnly)
     {
