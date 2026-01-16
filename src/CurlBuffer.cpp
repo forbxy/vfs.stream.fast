@@ -4,6 +4,7 @@
 #include <cctype>
 #include <kodi/addon-instance/VFS.h> // for logging
 #include <kodi/General.h>
+#include <kodi/Network.h>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -101,31 +102,9 @@ static int DebugCallback(CURL *handle, curl_infotype type, char *data, size_t si
 
 static std::string GetUserAgent()
 {
-    // [User Request] 强制使用 Chrome User-Agent，旧代码保留
-    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
-
-    /* 
-    // Old Kodi User-Agent Construction
-    struct kodi_version_t ver;
-    kodi::KodiVersion(ver);
-    
-    std::string result = "Kodi/" + std::to_string(ver.major) + "." + std::to_string(ver.minor);
-
-#if defined(_WIN32) || defined(_WIN64)
-    result += " (Windows NT 10.0; Win64; x64)";
-#elif defined(__APPLE__)
-    result += " (Macintosh; Intel Mac OS X 10_15_7)";
-#elif defined(__ANDROID__)
-    result += " (Linux; Android 9.0)";
-#elif defined(__linux__)
-    result += " (X11; Linux x86_64)";
-#else
-    result += " (Unknown Platform)";
-#endif
-
-    result += " App_Bitness/64 Version/" + std::to_string(ver.major) + "." + std::to_string(ver.minor);
-    return result;
-    */
+    // Use Kodi's API to get the exact native User-Agent string
+    // This ensures we match 'Kodi/21.2 (Windows NT ...)' exactly
+    return kodi::network::GetUserAgent();
 }
 
 // 简单的 Base64 编码实现 (避免依赖 kodi::tools 导致链接问题)
@@ -512,9 +491,9 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
 
                 final_size = content_length;
             }
-             // [Fix] 处理 403 Forbidden 情况 (某些网盘不接受 HEAD 请求)
-            // 回退策略: 尝试极小的 GET Range (bytes=0-1) 请求
-            else if (response_code == 403 || response_code == 405)
+             // [Fix] 处理 4xx/5xx 等非明确成功的情况 (包括 401/403/405 等)
+             // 只要不是 2xx (成功) 也不是 404/410 (明确的文件不存在)，都尝试回退 GET
+            else if (response_code != 404 && response_code != 410)
             {
                 kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat HEAD failed (%ld). Fallback to GET 0-1...", response_code);
                 
