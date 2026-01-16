@@ -242,10 +242,80 @@ void CCurlBuffer::Close()
     }
 }
 
+// -----------------------------------------------------------------------------------------
+// Helper: Detect Double Encoding
+// -----------------------------------------------------------------------------------------
+static bool IsLikelyDoubleEncoded(const std::string& url)
+{
+    // 特征: 出现超过一次 %25 且后面紧跟两个十六进制字符 (0-9, A-F)
+    // 根据请求：检测二次编码时，要出现两次 %25[HEX][HEX] 才认为是二次编码
+    int count = 0;
+    size_t pos = 0;
+    while ((pos = url.find("%25", pos)) != std::string::npos) {
+        if (pos + 4 < url.length()) {
+            char h1 = url[pos + 3];
+            char h2 = url[pos + 4];
+            if (isxdigit(h1) && isxdigit(h2)) {
+                count++;
+                if (count >= 2) return true;
+            }
+        }
+        pos += 3; 
+    }
+    return false;
+}
+
+static void FixDoubleEncoding(std::string& url)
+{
+    // 安全修复: 仅当 %25 后面跟着两个 HEX 字符时，才将其替换为 %
+    size_t pos = 0;
+    while ((pos = url.find("%25", pos)) != std::string::npos) {
+        bool is_double_encoded = false;
+        if (pos + 4 < url.length()) {
+            char h1 = url[pos + 3];
+            char h2 = url[pos + 4];
+            if (isxdigit(h1) && isxdigit(h2)) {
+                is_double_encoded = true;
+            }
+        }
+
+        if (is_double_encoded) {
+            url.replace(pos, 3, "%");
+            // 替换后变成了 %XX，我们需要跳过这个 % (pos+1) 继续检查后面
+            // 但考虑到三重编码的情况 (%2525E9 -> %25E9)，我们其实应该保留 pos 不动或者只 +1
+            // 这里为了简单安全，仅仅向前推进 1，防止死循环
+            pos += 1; 
+        } else {
+            pos += 3;
+        }
+    }
+}
+
 bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
 {
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 调用 Stat(), URL=%s", url.GetURL().c_str());
     m_file_url = url.GetURL();
+
+    // [Fix] Url Cleaning: Remove Kodi options (after '|')
+    // libcurl 不处理 '|' 及其后的选项，直接发给服务器会导致 400 或 插件崩溃
+    size_t pipe_pos = m_file_url.find('|');
+    if (pipe_pos != std::string::npos) {
+        m_file_url = m_file_url.substr(0, pipe_pos);
+    }
+    
+    // [Detection] 检测二次编码
+    if (IsLikelyDoubleEncoded(m_file_url)) {
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: [Warning] 检测到可能的二次编码 URL (Count >= 2)! (Contains %%25+Hex)");
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Original URL: %s", m_file_url.c_str());
+
+        std::string fixed_url_preview = m_file_url;
+        FixDoubleEncoding(fixed_url_preview);
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Fixed URL (Preview): %s", fixed_url_preview.c_str());
+        
+        // [Reserved] 自动修复代码保留但不执行
+        if (false) FixDoubleEncoding(m_file_url);
+    }
+
     m_username = url.GetUsername();
     m_password = url.GetPassword();
 
@@ -582,6 +652,25 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
 {
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Open() URL: %s", url.GetURL().c_str());
     m_file_url = url.GetURL();
+
+    // [Fix] Url Cleaning: Remove Kodi options (after '|')
+    size_t pipe_pos = m_file_url.find('|');
+    if (pipe_pos != std::string::npos) {
+        m_file_url = m_file_url.substr(0, pipe_pos);
+    }
+
+    if (IsLikelyDoubleEncoded(m_file_url)) {
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: [Warning] Open() 检测到可能的二次编码 URL (Count >= 2)! (Contains %%25+Hex)");
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Original URL: %s", m_file_url.c_str());
+
+        std::string fixed_url_preview = m_file_url;
+        FixDoubleEncoding(fixed_url_preview);
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Fixed URL (Preview): %s", fixed_url_preview.c_str());
+
+        // [Reserved] 自动修复代码保留但不执行
+        if (false) FixDoubleEncoding(m_file_url);
+    }
+
     m_username = url.GetUsername();
     m_password = url.GetPassword();
 
@@ -597,10 +686,38 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
     }
 
     // -------------------------------------------------------------
+    // [Fix] 静态缓存控制 (Static Cache Controller)
+    // -------------------------------------------------------------
+    // 1. 如果文件长度未知 (<=0) -> 禁用静态缓存，仅流式
+    if (m_total_size <= 0) {
+        m_disable_static_caches = true;
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件长度未知 (0), 禁用静态缓存模式, 仅使用流式.");
+    }
+    // 2. 如果文件太小 (< Preload Thresh) -> 禁用静态缓存 (不值得预热)
+    // 注意: m_cfg_preload_thresh 默认为 10GB, 也可以根据配置变化
+    else if (m_total_size < m_cfg_preload_thresh) {
+        m_disable_static_caches = true;
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件小于阈值 (%lld < %lld), 禁用静态缓存模式, 仅使用流式.", m_total_size, m_cfg_preload_thresh);
+    } 
+    else {
+        m_disable_static_caches = false;
+    }
+
+    // -------------------------------------------------------------
     // 动态内存策略 (Dynamic Memory Policy)
     // -------------------------------------------------------------
-    // 1. RingBuffer 大小: 若为小文件 (< 配置的 RingBuffer 大小)，Buffer 仅分配文件大小
-    if (m_total_size > 0 && m_total_size < (int64_t)m_cfg_ring_size)
+    // -------------------------------------------------------------
+    // 动态内存策略 (Dynamic Memory Policy)
+    // -------------------------------------------------------------
+    
+    // 1. 如果文件长度未知 (0)，使用保守的 Buffer 大小 (5MB)，避免浪费过多内存，同时保持流式能力
+    if (m_total_size <= 0)
+    {
+        m_ring_buffer_size = 5 * 1024 * 1024; // 5MB Conservative Buffer
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 未知长度 (0) -> RingBuffer: %zu bytes (Conservative)", m_ring_buffer_size);
+    }
+    // 2. RingBuffer 大小: 若为小文件 (< 配置的 RingBuffer 大小)，Buffer 仅分配文件大小
+    else if (m_total_size < (int64_t)m_cfg_ring_size)
     {
         // 向上对齐到 64KB
         size_t aligned_size = (size_t)((m_total_size + 65535) / 65536) * 65536;
@@ -682,11 +799,11 @@ size_t CCurlBuffer::CacheWriteCallback(void *contents, size_t size, size_t nmemb
 
 bool CCurlBuffer::PreloadCaches()
 {
-    // 如果文件小于设定阈值 (默认 1GB)，跳过头尾预热，直接使用 Ring Buffer 流式读取
-    if (m_total_size > 0 && m_total_size < m_cfg_preload_thresh)
+    // [Fix] 逻辑已移至 Open，从 PreloadCaches 移除
+    if (m_disable_static_caches)
     {
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件小于 %lld (设置阈值), 跳过头尾预热.", m_cfg_preload_thresh);
-        return true;
+         // 已在 Open 中记录日志
+         return true;
     }
 
     // 0. 本地缓存检查 (Local Check) - 避免重复进入 global lock
@@ -1316,10 +1433,15 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
     // PreloadCaches 内部有状态检查，初始化过的会直接返回 true，开销极小
     // 注意: 这里不加锁 buffer_mutex，因为 PreloadCaches 是独立的连接操作，且只在初始化时写入
     // 另外，如果下载失败，返回 -1 通知 Kodi 错误
-    if (!PreloadCaches())
+    
+    // [Fix] 仅当没有禁用静态缓存时才执行预热检查
+    if (!m_disable_static_caches)
     {
-        kodi::Log(ADDON_LOG_ERROR, "FastVFS: Read 失败 - 预热缓存下载失败");
-        return -1; // 返回 -1 表示读错误
+        if (!PreloadCaches())
+        {
+            kodi::Log(ADDON_LOG_ERROR, "FastVFS: Read 失败 - 预热缓存下载失败");
+            return -1; // 返回 -1 表示读错误
+        }
     }
 
     std::unique_lock<std::mutex> lock(m_ring_buffer_mutex);
@@ -1402,7 +1524,8 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
         // ---------------------------------------------------------
         
         // 如果 Worker 未运行，且确实需要使用热点缓存（非顺序读取，或者强制使用）
-        if (!m_worker_thread.joinable())
+        // [Fix] 只有当文件大小已知 (>0) 时才允许使用 JIT 缓存。未知大小时无法计算 Range。
+        if (!m_worker_thread.joinable() && m_total_size > 0)
         {
             // 尝试获取或创建 JIT Cache
             // CreateMiddleCache 内部会检查是否已存在有效的覆盖
