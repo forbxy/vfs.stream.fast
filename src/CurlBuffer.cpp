@@ -492,9 +492,9 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                 final_size = content_length;
             }
              // [Fix] 处理 4xx/5xx 等非明确成功的情况 (包括 401/403/405 等)
-             // 只要不是 2xx (成功) 也不是 404/410 (明确的文件不存在)，都尝试回退 GET
-            else if (response_code != 404 && response_code != 410)
-            {
+             // 以及 404/410 的情况，即使是 404/410，我们也尝试回退 GET
+             else 
+             {
                 kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat HEAD failed (%ld). Fallback to GET 0-1...", response_code);
                 
                 curl_easy_reset(curl);
@@ -817,6 +817,30 @@ bool CCurlBuffer::PreloadCaches()
     return ret;
 }
 
+// -----------------------------------------------------------------------------------------
+// Helper: Extract Host from URL (used to detect cross-domain redirects)
+// -----------------------------------------------------------------------------------------
+static std::string ExtractHost(const std::string& url)
+{
+    size_t protocol_pos = url.find("://");
+    if (protocol_pos == std::string::npos) return "";
+    size_t start = protocol_pos + 3;
+    
+    // Check for user:pass@
+    size_t at_pos = url.find('@', start);
+    size_t slash_pos = url.find('/', start);
+    
+    // If @ exists and is before /, start after @
+    if (at_pos != std::string::npos && (slash_pos == std::string::npos || at_pos < slash_pos))
+    {
+        start = at_pos + 1;
+    }
+    
+    size_t end = url.find('/', start);
+    if (end == std::string::npos) return url.substr(start);
+    return url.substr(start, end - start);
+}
+
 bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::vector<uint8_t>& buffer)
 {
     if (!curl) return false;
@@ -826,7 +850,21 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
     std::string target_url = ResolveRedirectUrl(m_file_url);
     curl_easy_setopt(curl, CURLOPT_URL, target_url.c_str());
 
-    if (!m_username.empty())
+    // [Fix] 鉴权逻辑：仅当 Target URL 与 Original URL 同源（或未发生跨域跳转）时才发送 Basic Auth
+    // 如果跳转到了 CDN (如 115 302 -> aliyun/tianyi signed url)，加上 Authorization 头会导致 400 Bad Request
+    bool should_send_auth = true;
+    if (target_url != m_file_url)
+    {
+        std::string host_origin = ExtractHost(m_file_url);
+        std::string host_target = ExtractHost(target_url);
+        if (!host_origin.empty() && !host_target.empty() && host_origin != host_target)
+        {
+             should_send_auth = false;
+            //  kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 跨域跳转检测 (%s -> %s), 禁用 Basic Auth", host_origin.c_str(), host_target.c_str());
+        }
+    }
+
+    if (!m_username.empty() && should_send_auth)
     {
         curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
         curl_easy_setopt(curl, CURLOPT_USERNAME, m_username.c_str());
@@ -1129,9 +1167,21 @@ void CCurlBuffer::SetupCurlOptions(CURL *curl, bool headOnly, int64_t startPos)
     }
     curl_easy_setopt(curl, CURLOPT_URL, target_url.c_str());
 
+    // [Fix] 鉴权逻辑：仅当 Target URL 与 Original URL 同源（或未发生跨域跳转）时才发送 Basic Auth
+    bool should_send_auth = true;
+    if (target_url != m_file_url)
+    {
+        std::string host_origin = ExtractHost(m_file_url);
+        std::string host_target = ExtractHost(target_url);
+        if (!host_origin.empty() && !host_target.empty() && host_origin != host_target)
+        {
+             should_send_auth = false;
+        }
+    }
+
     // 只要有用户名，就默认使用 Basic Auth 并强制预先发送 Header
     // 这是为了满足 "直接构造 Basic Auth 头" 的需求，避免等待 401 质询
-    if (!m_username.empty())
+    if (!m_username.empty() && should_send_auth)
     {
         curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
         curl_easy_setopt(curl, CURLOPT_USERNAME, m_username.c_str());
