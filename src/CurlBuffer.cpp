@@ -9,6 +9,7 @@
 #include <thread>
 #include <atomic>
 #include <map>
+#include <sstream>
 
 // 定义一些常量
 static const int MAX_RETRIES = 10;
@@ -826,6 +827,10 @@ void CCurlBuffer::StartWorker()
     m_download_position = m_logical_position; 
     
     m_worker_thread = std::thread(&CCurlBuffer::WorkerThread, this);
+
+    std::stringstream ss;
+    ss << m_worker_thread.get_id();
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Worker Thread Started. TID: %s", ss.str().c_str());
 }
 
 // -----------------------------------------------------------------------------------------
@@ -1242,6 +1247,17 @@ void CCurlBuffer::WorkerThread()
             // [Fix] 成功完成一次传输（或者正常EOF），应该清零重试计数器
             // 否则在不稳定的网络下，多次的小中断累积起来会导致误判为"彻底没救"
             retries = 0;
+
+            // [Auto-Detect Total Size]
+            // 如果初始 Stat 失败导致 m_total_size 为 0，而我们现在成功完成了一次下载，
+            // 那么当前的 m_download_position 很可能就是真实的文件大小 (EOF)。
+            // 我们需要更新 m_total_size，否则 Step 2 的 EOF 检查永远无法通过，导致无限发起 "Pos: End" 的 Range 请求 (Error 33)
+            if (m_total_size == 0 && m_download_position > 0)
+            {
+                 // 既然 res==OK，说明服务器认为发完了。我们信任当前的下载位置为文件末尾。
+                 m_total_size = m_download_position;
+                 kodi::Log(ADDON_LOG_INFO, "FastVFS: [Dynamic] 运行时修正文件大小: 0 -> %lld (Based on EOF)", m_total_size);
+            }
 
             // 正常结束，这通常意味着下载完了 (EOF)
             // 虽然我们在 Step 2 检查 EOF，但这里作为防御
