@@ -61,8 +61,15 @@ static std::mutex g_stat_cache_mutex;
 // 全局 Redirect 缓存 (302 Cache)
 // -----------------------------------------------------------------------------------------
 // 缓存 302 跳转后的有效 URL，下次直接访问目标地址
-// Key: Original URL, Value: Final Effective URL
-static std::map<std::string, std::string> g_redirect_cache;
+// [Fix] 增加时间戳以支持过期 (1小时)
+struct RedirectCacheEntry
+{
+    std::string target_url;
+    time_t timestamp;
+};
+
+// Key: Original URL, Value: RedirectCacheEntry
+static std::map<std::string, RedirectCacheEntry> g_redirect_cache;
 static std::mutex g_redirect_cache_mutex;
 // -----------------------------------------------------------------------------------------
 
@@ -210,12 +217,33 @@ static std::string ResolveRedirectUrl(const std::string& input_url)
 {
     std::string current = input_url;
     std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
+    time_t now = time(NULL);
+
     for(int i=0; i<10; i++)
     {
         auto it = g_redirect_cache.find(current);
-        if (it != g_redirect_cache.end() && it->second != current)
+        if (it != g_redirect_cache.end())
         {
-            current = it->second;
+            // [Fix] 检查有效期 (1小时 = 3600秒)
+            if (now - it->second.timestamp < 3600)
+            {
+                if (it->second.target_url != current)
+                {
+                    current = it->second.target_url;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            else
+            {
+                // 已过期，删除记录并停止递归解析，回退到当前的 URL (即过期的上级)
+                // 这样下次 Curl 请求就会使用这个 URL，重新触发重定向逻辑并更新缓存
+                // FIXME 可能会有多层下级过期的被保留，但影响不大
+                g_redirect_cache.erase(it);
+                break;
+            }
         }
         else
         {
@@ -257,7 +285,11 @@ void CCurlBuffer::UpdateRedirectCacheFromCurl(CURL* curl, const std::string& ori
              // 1. 更新全局跳转缓存: A -> B
              {
                  std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
-                 g_redirect_cache[original_url] = effective_url_str;
+                 // [Fix] 保存带有时间戳的缓存条目
+                 RedirectCacheEntry entry;
+                 entry.target_url = effective_url_str;
+                 entry.timestamp = time(NULL);
+                 g_redirect_cache[original_url] = entry;
              }
              
              kodi::Log(ADDON_LOG_DEBUG, "FastVFS: %s 检测到跳转: %s -> %s (Added to Cache)", context_name, original_url.c_str(), effective_url_str.c_str());
@@ -729,6 +761,9 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     {
         UpdateRedirectCacheFromCurl(curl, m_file_url, "Stat", this);
     }
+
+    // FIXME 应该在拿到最终的链接后使用所有的跳转路径判断文件格式，目前在UpdateRedirectCacheFromCurl
+    // 里更新is_iso标志，和整体的逻辑有点不一致
 
     // ---------------------------------------------------------
     // 3. 更新 Stat Cache (通用)
