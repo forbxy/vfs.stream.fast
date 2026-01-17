@@ -252,6 +252,50 @@ void CCurlBuffer::UpdateRedirectCacheFromCurl(CURL* curl, const std::string& ori
              }
              
              kodi::Log(ADDON_LOG_DEBUG, "FastVFS: %s 检测到跳转: %s -> %s (Added to Cache)", context_name, original_url.c_str(), effective_url_str.c_str());
+
+             // [New] 如果发生了跳转，尝试从最终响应中获取正确的文件大小
+             if (self)
+             {
+                 int64_t new_size = 0;
+                 struct curl_header *h = NULL;
+                 
+                 // 1. 尝试 Content-Range (Worker/DownloadRange 常用)
+                 if (curl_easy_header(curl, "Content-Range", 0, CURLH_HEADER, -1, &h) == CURLHE_OK)
+                 {
+                     if (h && h->value) {
+                         std::string cr(h->value);
+                         auto pos = cr.find('/');
+                         if (pos != std::string::npos) {
+                             std::string total_str = cr.substr(pos + 1);
+                             if (total_str != "*" && !total_str.empty()) {
+                                 try { new_size = std::stoll(total_str); } catch(...) {}
+                             }
+                         }
+                     }
+                 }
+                 
+                 // 2. 如果没找到 Range，且是 200 OK (非 Partial)，尝试 Content-Length
+                 if (new_size <= 0)
+                 {
+                     long response_code = 0;
+                     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+                     if (response_code == 200)
+                     {
+                         curl_off_t cl = -1;
+                         if (curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl) == CURLE_OK && cl > 0)
+                         {
+                             new_size = (int64_t)cl;
+                         }
+                     }
+                 }
+
+                 // 更新大小 (如果此时我们不知道大小，或者大小不一致)
+                 if (new_size > 0 && (self->m_total_size == 0 || self->m_total_size != new_size))
+                 {
+                     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [%s] Redirect target provided new size: %lld (Old: %lld)", context_name, new_size, self->m_total_size);
+                     self->m_total_size = new_size;
+                 }
+             }
         }
     }
 }
