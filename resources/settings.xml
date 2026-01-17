@@ -65,7 +65,7 @@
                 </setting>
                 <setting id="cache_iso_only" type="boolean" label="30008">
                     <level>0</level>
-                    <default>false</default>
+                    <default>true</default>
                     <control type="toggle" />
                 </setting>
             </group>
