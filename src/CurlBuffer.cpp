@@ -124,6 +124,40 @@ static std::string SimpleBase64Encode(const std::string &in) {
     return out;
 }
 
+// [New] 获取文件扩展名函数 (使用 libcurl URL API 解析)
+std::string CCurlBuffer::GetFileExtensionFromUrl(const std::string& url)
+{
+    std::string extension = "unknown";
+    CURLU *h = curl_url();
+    if(!h) return extension;
+
+    // 解析 URL
+    CURLUcode rc = curl_url_set(h, CURLUPART_URL, url.c_str(), 0);
+    if(!rc) {
+        char *path = NULL;
+        // 提取 Path 部分 (会自动去除 ?query 和 #fragment)
+        rc = curl_url_get(h, CURLUPART_PATH, &path, 0);
+        if(!rc && path) {
+            std::string path_str(path);
+            
+            // 1. 获取最后一段文件名 (Find last slash)
+            size_t last_slash = path_str.rfind('/');
+            std::string filename = (last_slash == std::string::npos) ? path_str : path_str.substr(last_slash + 1);
+
+            // 2. 查找文件名中的最后一个点
+            size_t dot_pos = filename.rfind('.');
+            if (dot_pos != std::string::npos && dot_pos + 1 < filename.length()) {
+                extension = filename.substr(dot_pos + 1);
+                // 转换为小写
+                std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+            }
+            curl_free(path);
+        }
+    }
+    curl_url_cleanup(h);
+    return extension;
+}
+
 // -----------------------------------------------------------------------------------------
 // Helper: Resolve Recursive Redirects
 // -----------------------------------------------------------------------------------------
@@ -184,13 +218,26 @@ static std::string ResolveRedirectUrl(const std::string& input_url)
 // -----------------------------------------------------------------------------------------
 // Helper: Update Redirect Cache from CURL effective URL
 // -----------------------------------------------------------------------------------------
-static void UpdateRedirectCacheFromCurl(CURL* curl, const std::string& original_url, const char* context_name)
+// [Fix] 增加 self 指针以更新实例状态 (ISO 检测)
+void CCurlBuffer::UpdateRedirectCacheFromCurl(CURL* curl, const std::string& original_url, const char* context_name, CCurlBuffer* self)
 {
     char *eff_url = NULL;
     curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff_url);
     if (eff_url)
     {
         std::string effective_url_str(eff_url);
+
+        // [Feature] ISO 二次检测
+        // 如果之前没有判定为 ISO，但发生了跳转，则检查最终 URL 是否表明它是 ISO
+        if (self && !self->m_is_iso)
+        {
+             std::string ext = CCurlBuffer::GetFileExtensionFromUrl(effective_url_str);
+             if (ext == "iso")
+             {
+                 self->m_is_iso = true;
+                 kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [%s] 检测到重定向后目标是 ISO 文件 (Update Flag).", context_name);
+             }
+        }
         
         // 只有当有效 URL 与请求的 URL 不同时才认为是跳转
         // 且不只是协议的区别 (http vs https)
@@ -334,6 +381,10 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
 
     // 保存原始地址以用作缓存 Key
     std::string original_url = m_file_url;
+    
+    // [Init] 初始化 ISO 标志
+    std::string ext = GetFileExtensionFromUrl(original_url);
+    m_is_iso = (ext == "iso");
 
     // ---------------------------------------------------------
     // 0. 检查全局 Stat 缓存
@@ -607,7 +658,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     // ---------------------------------------------------------
     if (res == CURLE_OK)
     {
-        UpdateRedirectCacheFromCurl(curl, m_file_url, "Stat");
+        UpdateRedirectCacheFromCurl(curl, m_file_url, "Stat", this);
     }
 
     // ---------------------------------------------------------
@@ -1046,7 +1097,7 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
         // ---------------------------------------------------------
         // Update Redirect Cache (如果发生了跳转)
         // ---------------------------------------------------------
-        UpdateRedirectCacheFromCurl(curl, m_file_url, "DownloadRange");
+        UpdateRedirectCacheFromCurl(curl, m_file_url, "DownloadRange", this);
     }
 
     if (res == CURLE_OK && (response_code >= 200 && response_code < 300))
@@ -1171,7 +1222,7 @@ void CCurlBuffer::WorkerThread()
         // ---------------------------------------------------------
         if (res == CURLE_OK)
         {
-            UpdateRedirectCacheFromCurl(curl, m_file_url, "Worker");
+            UpdateRedirectCacheFromCurl(curl, m_file_url, "Worker", this);
         }
 
         // ---------------------------------------------------------
@@ -1545,7 +1596,12 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
             // 尝试获取或创建 JIT Cache
             // CreateMiddleCache 内部会检查是否已存在有效的覆盖
             // 注意：原本只针对 Random Seek，现在根据指示，对于 !Worker 的情况直接依赖 JIT
-            if (!CreateMiddleCache(m_logical_position))
+            
+            // [Optimization] 将下载起始位置向前移动 10%，增加命中几率并覆盖可能的小幅回跳
+            int64_t back_offset = (int64_t)(m_cfg_middle_size / 10);
+            int64_t adjusted_start = (m_logical_position > back_offset) ? (m_logical_position - back_offset) : 0;
+            
+            if (!CreateMiddleCache(adjusted_start))
             {
                 kodi::Log(ADDON_LOG_ERROR, "FastVFS: CreateMiddleCache 下载失败，Read 终止.");
                 return -1;
@@ -1577,9 +1633,11 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
                 // 如果读取进度超过了热点缓存的一半，且 Worker 未启动，说明这可能是一个连续播放行为
                 // 提前启动 Worker，实现无缝衔接 (虽然可能重复下载一小段热点缓存中剩余的数据，但保证了逻辑简单连续)
                 // [优化] 只有当 JIT 缓存没有覆盖到文件末尾时才启动 Worker。如果 JIT 已经包含 EOF，直接用 JIT 读完即可。
+                // [Request] 针对 ISO 文件，禁用 JIT 接力机制 (避免频繁触发 Worker)
                 bool is_covered_to_eof = (m_total_size > 0 && (m_middle_valid_from + (int64_t)m_middle_buffer->size() >= m_total_size));
 
-                if (!m_worker_thread.joinable() && !is_covered_to_eof && offset > m_middle_buffer->size() / 2)
+                // [Optimized] 使用成员变量 m_is_iso，该变量会在 Stat/DownloadRange 的重定向中自动更新
+                if (!m_worker_thread.joinable() && !is_covered_to_eof && !m_is_iso && offset > m_middle_buffer->size() / 2)
                 {
                     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 检测到连续读取 (Offset: %zu > Half), 提前启动 Worker 接力.", offset);
                     StartWorker();
@@ -1804,7 +1862,7 @@ bool CCurlBuffer::CreateMiddleCache(int64_t start_pos)
         {
             m_middle_buffer = g_data_cache.middle_buffer;
             m_middle_valid_from = g_data_cache.middle_valid_from;
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 命中全局热点缓存 (复用). Valid: %lld", m_middle_valid_from);
+            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 复用全局热点缓存. Valid: %lld", m_middle_valid_from);
             return true;
         }
     }

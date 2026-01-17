@@ -64,6 +64,7 @@ protected:
     // 状态变量
     bool m_support_range = true;
     bool m_is_directory = false;
+    bool m_is_iso = false; // [New] 标记是否为 ISO 文件
     time_t m_mod_time = 0;
     time_t m_access_time = 0;
 
@@ -78,6 +79,8 @@ protected:
 
     // 内部辅助
     void SetupCurlOptions(CURL *curl, bool headOnly, int64_t startPos = 0);
+    static void UpdateRedirectCacheFromCurl(CURL* curl, const std::string& original_url, const char* context_name, CCurlBuffer* self = nullptr);
+    static std::string GetFileExtensionFromUrl(const std::string& url); // [New] Get Extension Helper
 
 private:
     // 基础信息
