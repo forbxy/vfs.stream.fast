@@ -79,6 +79,15 @@ static int DebugCallback(CURL *handle, curl_infotype type, char *data, size_t si
             kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Req Header] >> %s", header.c_str());
         }
     }
+    else if (type == CURLINFO_HEADER_IN) {
+        std::string header(data, size);
+        while (!header.empty() && (isspace((unsigned char)header.back()))) {
+            header.pop_back();
+        }
+        if (!header.empty()) {
+            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Resp Header] << %s", header.c_str());
+        }
+    }
     // 添加连接信息日志，验证 TCP 复用
     else if (type == CURLINFO_TEXT) {
         std::string text(data, size);
@@ -285,6 +294,13 @@ void CCurlBuffer::UpdateRedirectCacheFromCurl(CURL* curl, const std::string& ori
                          if (curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl) == CURLE_OK && cl > 0)
                          {
                              new_size = (int64_t)cl;
+                         }
+                         // [Explicit] 如果确实拿不到长度 (例如 GZIP 且没 Content-Length)，显式设为 0
+                         // 这样后续逻辑就会禁用静态缓存并使用保守 RingBuffer
+                         else
+                         {
+                             new_size = 0; 
+                             // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Redirect 200 OK but no Content-Length found (likely GZIP/Chunked). Size=0");
                          }
                      }
                  }
@@ -659,7 +675,15 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                 if (explicit_accept_ranges) m_support_range = true;
                 else m_support_range = false;
 
-                final_size = content_length;
+                if (content_length > 0)
+                {
+                    final_size = content_length;
+                }
+                else
+                {
+                    // [Important] 无法确定长度时，显式设为 0，而不是保持初始化的 -1 (或错误的 cl -1)
+                    final_size = 0;
+                }
             }
              // [Fix] 处理 4xx/5xx 等非明确成功的情况 (包括 401/403/405 等)
              // 以及 404/410 的情况，即使是 404/410，我们也尝试回退 GET
@@ -1113,8 +1137,8 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
     
     // 设置 User-Agent (模仿 Kodi 原生 behavior)
     curl_easy_setopt(curl, CURLOPT_USERAGENT, GetUserAgent().c_str());
-    // 模仿 Kodi 默认的 Accept-Encoding
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    // [Fix] 全局禁用压缩 (identity) 以避免 gzip 干扰 range 下载
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
     // 模仿 Kodi 默认禁用 Auto Referer
     curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 0L);
 
@@ -1395,8 +1419,10 @@ void CCurlBuffer::SetupCurlOptions(CURL *curl, bool headOnly, int64_t startPos)
     // 设置 User-Agent (模仿 Kodi 原生 behavior)
     curl_easy_setopt(curl, CURLOPT_USERAGENT, GetUserAgent().c_str());
 
-    // 模仿 Kodi 默认的 Accept-Encoding (允许压缩)
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    // [Fixed] 全局禁用压缩 (identity)
+    // 1. 确保 Stat (HEAD) 能拿到真实文件大小
+    // 2. 避免 Range 下载时服务器返回压缩流导致 seek 失败
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
     
     // 模仿 Kodi 默认禁用 Auto Referer (模拟 ffmpeg/browser 行为)
     curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 0L);
@@ -1743,17 +1769,22 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
 
     bool need_reset = false;
 
+    // [New] 本次 Read 调用的超时重试计数
+    int timeout_retry_count = 0;
+
     // 情况 A: 落后 (Lag) - 数据已被覆盖
     if (m_logical_position < buffer_valid_start)
     {
         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 落后 (Lag). Req: %lld, BufStart: %lld. 触发瞬移.", m_logical_position, buffer_valid_start);
         need_reset = true;
     }
-    // 情况 B: 超前 (Too Far) - 超出计划范围 (定义为当前下载点 + 缓冲区大小)
+    // 情况 B: 超前 (Too Far) - 超出计划范围，或者虽然在计划内但差距过大
     // 如果 Seek 到很远的位置，超过了这个范围，与其等待下载这一大段无用数据，不如直接重置
-    else if (m_logical_position > plan_limit)
+    // [Fix] 增加 gap > 20MB 的判断。即使 Buffer 很大(100MB+)，如果 gap 很大，等待下载不如重新连接快。
+    else if (m_logical_position > plan_limit || (m_logical_position - buffer_valid_end) > (16 * 1024 * 1024))
     {
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 超前 (Too Far). Req: %lld, Limit: %lld. 触发瞬移.", m_logical_position, plan_limit);
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 超前 (Too Far/Gap > 16MB). Req: %lld, Limit: %lld, Gap: %lld. 触发瞬移.", 
+            m_logical_position, plan_limit, (int64_t)(m_logical_position - buffer_valid_end));
         need_reset = true;
     }
 
@@ -1818,8 +1849,43 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
             
             // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read Waiting... (Pos: %lld, BufStart: %lld, BufEnd: %lld)", m_logical_position, buf_start, buf_end);
 
-            m_cv_reader.wait(lock);
-            
+            // [Fix] 增加等待超时保护 (10秒)
+            // 如果 10 秒内 Worker 没填上数据 (Gap 填充太慢，或死锁)，强制重试
+            if (m_cv_reader.wait_for(lock, std::chrono::seconds(15)) == std::cv_status::timeout)
+            {
+                timeout_retry_count++;
+                kodi::Log(ADDON_LOG_WARNING, "FastVFS: Read 等待超时 (15s). Retry: %d/3. Req: %lld", timeout_retry_count, m_logical_position);
+                
+                if (timeout_retry_count >= 3)
+                {
+                    kodi::Log(ADDON_LOG_ERROR, "FastVFS: Read 连续超时失败，放弃重试。");
+                    m_has_error = true; // 标记错误，避免后续死循环
+                    
+                    // 如果已经读到了一些数据，返回它，让 Kodi 决定是否重试
+                    // 否则返回错误 -1
+                    return total_read > 0 ? total_read : -1;
+                }
+
+                m_reset_target_pos = m_logical_position;
+                m_trigger_reset = true;
+                m_abort_transfer = true;
+                
+                // 唤醒 Worker 处理重置
+                m_cv_writer.notify_all(); 
+
+                // [Fix] 显式清除状态，确保 continue 后不会因为旧状态退出循环
+                m_has_error = false;
+                m_is_eof = false;
+                
+                // 此时虽然 timeout 了，但我们不能直接 return error
+                // 而是 continue 回去，下一次 loop 会检测到 m_trigger_reset 为 true (或者 worker 已经响应并开始了)
+                // 这里的 continue 会重新计算 avail_in_buffer，仍然 <= 0，然后再次 wait，但这次 wait 会被 worker 的 notify 唤醒
+                continue;
+            }
+
+            // 成功被唤醒 (收到数据, 或 Error, 或 EOF)，重置超时计数
+            timeout_retry_count = 0;
+
             // 唤醒后重新检查状态
             if (!m_is_running) return -1; // 发生重连或停止
             continue;
