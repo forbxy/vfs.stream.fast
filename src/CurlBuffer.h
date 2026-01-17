@@ -51,6 +51,7 @@ public:
     size_t m_cfg_ring_size = 100 * 1024 * 1024;   // 主 RingBuffer 大小
     size_t m_cfg_history_size = 10 * 1024 * 1024; // 保留历史数据大小
     int64_t m_cfg_preload_thresh = 10LL * 1024 * 1024 * 1024;   // <10GB 跳过预热(Preload Head/Tail)
+    bool m_cfg_cache_iso_only = true; // [New] 仅 ISO 开启缓存
 
     // [New] 动态缓存屏蔽阈值
     std::atomic<bool> m_disable_static_caches{false};

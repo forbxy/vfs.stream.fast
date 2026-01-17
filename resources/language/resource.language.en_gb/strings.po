@@ -32,3 +32,7 @@ msgstr "Played Data Buffer Size (MB)"
 msgctxt "#30007"
 msgid "Min File Size to Preload (GB)"
 msgstr "Min File Size to Preload (GB)"
+
+msgctxt "#30008"
+msgid "Enable Cache Only for ISO"
+msgstr "Enable Cache Only for ISO"

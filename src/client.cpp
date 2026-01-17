@@ -60,10 +60,20 @@ kodi::addon::VFSFileHandle CClientVFS::Open(const kodi::addon::VFSUrl &url)
     file->m_cfg_ring_size = ahead_size + file->m_cfg_history_size;
 
     file->m_cfg_preload_thresh = (int64_t)MyGetSettingInt("preload_thresh", 10) * 1024 * 1024 * 1024;
+    
+    // [New] 读取 Only ISO Cache 选项 (默认 true)
+    using namespace kodi::addon;
+    bool cache_iso_only = true; 
+    if (CPrivateBase::m_interface && CPrivateBase::m_interface->toKodi && CPrivateBase::m_interface->toKodi->kodi_addon) {
+        CPrivateBase::m_interface->toKodi->kodi_addon->get_setting_bool(
+          CPrivateBase::m_interface->toKodi->kodiBase, "cache_iso_only", &cache_iso_only);
+    }
+    file->m_cfg_cache_iso_only = cache_iso_only;
 
-    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Config -> H/T/M/R/His = %zu/%zu/%zu/%zu/%zu MB, Pre = %lld GB",
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Config -> H/T/M/R/His = %zu/%zu/%zu/%zu/%zu MB, Pre = %lld GB, ISOOnly=%d",
         file->m_cfg_head_size >> 20, file->m_cfg_tail_size >> 20, file->m_cfg_middle_size >> 20, 
-        file->m_cfg_ring_size >> 20, file->m_cfg_history_size >> 20, file->m_cfg_preload_thresh >> 30);
+        file->m_cfg_ring_size >> 20, file->m_cfg_history_size >> 20, file->m_cfg_preload_thresh >> 30,
+        file->m_cfg_cache_iso_only);
 
     // 初始化我们的加速器
     // 这里传入完整的 VFSUrl 对象，因为我们需要里面的 auth 信息

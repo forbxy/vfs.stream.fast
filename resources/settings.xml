@@ -63,6 +63,11 @@
                     </constraints>
                     <control type="slider" format="integer" />
                 </setting>
+                <setting id="cache_iso_only" type="boolean" label="30008">
+                    <level>0</level>
+                    <default>false</default>
+                    <control type="toggle" />
+                </setting>
             </group>
         </category>
     </section>

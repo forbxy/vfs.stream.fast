@@ -32,3 +32,7 @@ msgstr "已播放数据缓存大小 (MB)"
 msgctxt "#30007"
 msgid "Min File Size to Preload (GB)"
 msgstr "文件超过多大启用缓存头尾 (GB)"
+
+msgctxt "#30008"
+msgid "Enable Cache Only for ISO"
+msgstr "仅 ISO 启用缓存"

@@ -572,7 +572,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         // -------------------------------------------------------------
         
         SetupCurlOptions(curl, true); // Head Only模式 (设置 CURLOPT_NOBODY)
-        curl_easy_setopt(curl, CURLOPT_RANGE, "0-0");
+        // curl_easy_setopt(curl, CURLOPT_RANGE, "0-0");
         curl_easy_setopt(curl, CURLOPT_FILETIME, 1L); // 让 libcurl 处理时间
 
         res = curl_easy_perform(curl);
@@ -793,19 +793,29 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
     // -------------------------------------------------------------
     // [Fix] 静态缓存控制 (Static Cache Controller)
     // -------------------------------------------------------------
+    
+    // 默认启用，后面根据条件禁用
+    m_disable_static_caches = false;
+
     // 1. 如果文件长度未知 (<=0) -> 禁用静态缓存，仅流式
     if (m_total_size <= 0) {
         m_disable_static_caches = true;
         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件长度未知 (0), 禁用静态缓存模式, 仅使用流式.");
     }
-    // 2. 如果文件太小 (< Preload Thresh) -> 禁用静态缓存 (不值得预热)
-    // 注意: m_cfg_preload_thresh 默认为 10GB, 也可以根据配置变化
-    else if (m_total_size < m_cfg_preload_thresh) {
+    // 2. 如果开启了 [仅ISO缓存] 且当前文件不是ISO -> 禁用静态缓存
+    // 这涵盖了所有 mp4/mkv/ts 等容器，以及任何只要不是 ISO 的文件
+    else if (m_cfg_cache_iso_only && !m_is_iso) {
+         m_disable_static_caches = true;
+         // 获取扩展名仅用于日志
+         std::string ext = GetFileExtensionFromUrl(m_file_url);
+         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Config] 仅ISO开启缓存，非ISO文件 (Ext: %s) -> 禁用静态缓存.", ext.c_str());
+    }
+
+
+    // 3. (Fallback) 如果缓存尚未禁用，但文件太小 (< Preload Thresh) -> 禁用静态缓存 (不值得预热)
+    if (!m_disable_static_caches && m_total_size < m_cfg_preload_thresh) {
         m_disable_static_caches = true;
         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件小于阈值 (%lld < %lld), 禁用静态缓存模式, 仅使用流式.", m_total_size, m_cfg_preload_thresh);
-    } 
-    else {
-        m_disable_static_caches = false;
     }
 
     // -------------------------------------------------------------
