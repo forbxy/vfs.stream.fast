@@ -256,7 +256,7 @@ static std::string ResolveRedirectUrl(const std::string& input_url)
 // -----------------------------------------------------------------------------------------
 // Helper: Update Redirect Cache from CURL effective URL
 // -----------------------------------------------------------------------------------------
-// [Fix] 增加 self 指针以更新实例状态 (ISO 检测)
+// [Fix] 增加 self 指针以更新 m_total_size 等
 void CCurlBuffer::UpdateRedirectCacheFromCurl(CURL* curl, const std::string& original_url, const char* context_name, CCurlBuffer* self)
 {
     char *eff_url = NULL;
@@ -264,18 +264,6 @@ void CCurlBuffer::UpdateRedirectCacheFromCurl(CURL* curl, const std::string& ori
     if (eff_url)
     {
         std::string effective_url_str(eff_url);
-
-        // [Feature] ISO 二次检测
-        // 如果之前没有判定为 ISO，但发生了跳转，则检查最终 URL 是否表明它是 ISO
-        if (self && !self->m_is_iso)
-        {
-             std::string ext = CCurlBuffer::GetFileExtensionFromUrl(effective_url_str);
-             if (ext == "iso")
-             {
-                 self->m_is_iso = true;
-                 kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [%s] 检测到重定向后目标是 ISO 文件 (Update Flag).", context_name);
-             }
-        }
         
         // 只有当有效 URL 与请求的 URL 不同时才认为是跳转
         // 且不只是协议的区别 (http vs https)
@@ -676,7 +664,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                 }
             }
         }
-        
+
         // 尝试判断是否为目录
         bool apparent_directory = false;
         char *ct = NULL;
@@ -713,46 +701,111 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                 }
                 else
                 {
-                    // [Important] 无法确定长度时，显式设为 0，而不是保持初始化的 -1 (或错误的 cl -1)
+                    // [Important] 无法确定长度时，则默认给 0，依靠后续逻辑判断是否需要 fallback
                     final_size = 0;
                 }
             }
-             // [Fix] 处理 4xx/5xx 等非明确成功的情况 (包括 401/403/405 等)
-             // 以及 404/410 的情况，即使是 404/410，我们也尝试回退 GET
-             else 
+            
+            // 对 .bdmv, .IFO, .BDM 等蓝光结构及图片文件，不做 fallback
+            // 这些通常确实是小文件 且大多是kodi在频繁的扫文件夹，如果使用get，会穿透webdav缓存，直接访问源服务器，导致账号被风控
+            std::string ext = GetFileExtensionFromUrl(m_file_url); 
+            // GetFileExtensionFromUrl 已转小写
+            bool is_sensitive_file = (ext == "bdmv" || ext == "ifo" || ext == "bdm" || 
+                                    ext == "jpg" || ext == "png" || ext == "tbn");
+            
+             bool need_fallback = false;
+             if (!is_sensitive_file)
              {
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat HEAD failed (%ld). Fallback to GET 0-1...", response_code);
-                
-                curl_easy_reset(curl);
-                SetupCurlOptions(curl, false); // 不是 HEAD
-                curl_easy_setopt(curl, CURLOPT_RANGE, "0-1"); 
-                // 不要 WriteCallback，只要头信息
-                 curl_easy_setopt(curl, CURLOPT_NOBODY, 0L); // 需要 Body
-                 curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](void* buffer, size_t size, size_t nmemb, void* userp) -> size_t {
-                    return size * nmemb; // 丢弃数据
-                });
+                // 一些服务器不支持 HEAD 请求，返回 4xx 错误码
+                if (response_code >= 400 && response_code < 500)
+                {
+                    need_fallback = true;
+                }
+                //对于一些302跳转的服务器，head请求不执行跳转，我们必须使用GET请求来触发跳转获取正确的文件大小
+                else if (response_code == 200 && content_length <= 0)
+                {
+                    need_fallback = true;
+                }
+             }
 
-                res = curl_easy_perform(curl);
-                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-                
-                if (res == CURLE_OK && response_code == 206) {
-                     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Fallback GET Success. Code=206");
-                     
-                     // 此时 Content-Range 是必须的
-                     if (curl_easy_header(curl, "Content-Range", 0, CURLH_HEADER, -1, &h) == CURLHE_OK) {
-                         if (h && h->value) {
-                             std::string cr(h->value);
-                             auto pos = cr.find('/');
-                             if (pos != std::string::npos) {
-                                 try { final_size = std::stoll(cr.substr(pos + 1)); } catch(...) {}
-                             }
-                         }
-                     }
-                     m_support_range = true; // 能 206 就是支持
+             if (need_fallback)
+             {
+                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat HEAD failed or Size=0 (%ld). Fallback to GET 0-1...", response_code);
+                    
+                    curl_easy_reset(curl);
+                    SetupCurlOptions(curl, false); // 不是 HEAD
+                    curl_easy_setopt(curl, CURLOPT_RANGE, "0-1"); 
+                    // 不要 WriteCallback，只要头信息
+                    curl_easy_setopt(curl, CURLOPT_NOBODY, 0L); // 需要 Body
+
+                    // [Safety] 必须防止服务器忽略 Range 直接发送全量文件 (返回 200 OK)
+                    // 如果是这样，curl_easy_perform 会一直下载直到文件结束，导致卡死
+                    // 我们设置一个回调，如果数据量超过阈值 (比如 10KB)，就强制断开
+                    struct FallbackCtx {
+                        size_t total_received = 0;
+                    } fb_ctx;
+                    
+                    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &fb_ctx);
+                    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](void* buffer, size_t size, size_t nmemb, void* userp) -> size_t {
+                        FallbackCtx* ctx = (FallbackCtx*)userp;
+                        size_t real_size = size * nmemb;
+                        ctx->total_received += real_size;
+                        
+                        // 阈值设为 10KB (Range 0-1 理论只要 2 字节)
+                        if (ctx->total_received > 10 * 1024) {
+                             // 返回 0 会触发 CURLE_WRITE_ERROR 中断传输
+                             return 0; 
+                        }
+                        return real_size; // 丢弃数据但告诉 libcurl 已消费
+                    });
+
+                    res = curl_easy_perform(curl);
+                    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+                    
+                    // [Safety] 如果是被我们主动中断的 (CURLE_WRITE_ERROR)，且是因为服务器发太多数据了
+                    // 这通常意味着服务器是 200 OK (不支持 Range)，但也意味着 Header 已经收到了
+                    if (res == CURLE_WRITE_ERROR && fb_ctx.total_received > 10 * 1024)
+                    {
+                        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Fallback GET aborted (Too much data). Server likely ignores Range.");
+                        // 尝试继续使用已获取的 header 信息
+                        res = CURLE_OK; 
+                    }
+
+                    if (res == CURLE_OK) 
+                    {
+                        if (response_code == 206) {
+                            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Fallback GET Success. Code=206");
+                            
+                            // 此时 Content-Range 是必须的
+                            if (curl_easy_header(curl, "Content-Range", 0, CURLH_HEADER, -1, &h) == CURLHE_OK) {
+                                if (h && h->value) {
+                                    std::string cr(h->value);
+                                    auto pos = cr.find('/');
+                                    if (pos != std::string::npos) {
+                                        try { final_size = std::stoll(cr.substr(pos + 1)); } catch(...) {}
+                                    }
+                                }
+                            }
+                            m_support_range = true; // 能 206 就是支持
+                        }
+                        // 处理 200 OK 的情况 (有些服务器不支持 Range，直接返 200 和 Content-Length)
+                        // 如果文件非常大怎么办？
+                        else if (response_code == 200) {
+                            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Fallback GET Success (No Range). Code=200");
+                            
+                            curl_off_t cl = -1;
+                            if (curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl) == CURLE_OK && cl > 0)
+                            {
+                                final_size = (int64_t)cl;
+                            }
+                            // 如果是 GET 0-1 返回了 200 OK，说明不支持 Range，且返回的是完整文件
+                            m_support_range = false; 
+                        }
+                    }
                 }
             }
         }
-    }
+    
 
     // ---------------------------------------------------------
     // Update Redirect Cache (如果发生了跳转)
@@ -1142,7 +1195,12 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
 
     // 复用 SetupCurlOptions 的部分逻辑，但需要手动设置 WriteFunction
     // 同样使用 ResolveRedirectUrl 确保预热请求也是最新的
-    std::string target_url = ResolveRedirectUrl(m_file_url);
+    std::string target_url = m_file_url;
+    if (m_is_iso)
+    {
+        target_url = ResolveRedirectUrl(m_file_url);
+    }
+    
     curl_easy_setopt(curl, CURLOPT_URL, target_url.c_str());
 
     // [Fix] 鉴权逻辑：仅当 Target URL 与 Original URL 同源（或未发生跨域跳转）时才发送 Basic Auth
@@ -1469,7 +1527,13 @@ void CCurlBuffer::SetupCurlOptions(CURL *curl, bool headOnly, int64_t startPos)
 
     // B. 策略调整：下载阶段使用解析后的 URL
     // 在这里进行最终的 URL 解析，递归查找最新的有效地址
-    std::string target_url = ResolveRedirectUrl(m_file_url);
+    std::string target_url = m_file_url;
+    
+    if (m_is_iso)
+    {
+        target_url = ResolveRedirectUrl(m_file_url);
+    }
+    
     if (target_url != m_file_url) {
         // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: URL Resolved: %s -> %s", m_file_url.c_str(), target_url.c_str());
     }
