@@ -22,19 +22,39 @@
 ## 源码编译
 
 本项目使用 CMake 和 vcpkg 进行依赖管理。
+**注意**：编译需要 Kodi 的 C++ 头文件 (kodi-dev-kit)，因此需要下载 Kodi 源码。
 
 ### 前置要求
 - CMake
-- vcpkg
+- [vcpkg](https://github.com/microsoft/vcpkg)
 - C++ Compiler (MSVC, GCC, Clang)
+- **Kodi 源码** (推荐分支: `Omega`)
 
-### 编译说明
+### 编译说明 (Windows)
+
+其他平台 (Linux, Android) 的编译或交叉编译请参考 [.github/workflows/build.yml](.github/workflows/build.yml)。
+
+假设您的目录结构如下（vfs 插件和 xbmc 源码并列）：
+```text
+workspace/
+  ├── vfs.stream.fast/
+  └── xbmc/  <-- 需要 clone Kodi 源码到这里
+```
+
+生成的命令如下：
 
 ```bash
+# 1. 准备目录结构（如果还没下载 Kodi 源码）
+cd ..
+git clone https://github.com/xbmc/xbmc.git
+cd vfs.stream.fast
+
+# 2. 编译
 mkdir build
 cd build
-cmake .. -DCMAKE_TOOLCHAIN_FILE=[path to vcpkg]/scripts/buildsystems/vcpkg.cmake
-cmake --build .
+# 如果 xbmc 源码不在默认的 ../xbmc，请通过 -DKODI_SOURCE_DIR=/path/to/xbmc 指定
+cmake .. -DCMAKE_TOOLCHAIN_FILE=[path/to/vcpkg]/scripts/buildsystems/vcpkg.cmake
+cmake --build . --config Release
 ```
 
 ## 关于 STRM

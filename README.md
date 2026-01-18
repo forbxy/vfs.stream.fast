@@ -22,19 +22,39 @@ This addon accelerates the playback of large files (like ISOs) over network prot
 ## Build from Source
 
 This project uses CMake and vcpkg for dependency management.
+**Note**: You need the Kodi C++ headers (kodi-dev-kit) to build this addon, so the Kodi source code is required.
 
 ### Prerequisites
 - CMake
-- vcpkg
+- [vcpkg](https://github.com/microsoft/vcpkg)
 - C++ Compiler (MSVC, GCC, Clang)
+- **Kodi Source Code** (Recommended branch: `Omega`)
 
-### Build Instructions
+### Build Instructions (Windows)
+
+For compilation or cross-compilation on other platforms (Linux, Android), please refer to [.github/workflows/build.yml](.github/workflows/build.yml).
+
+Assuming your directory structure is as follows (vfs addon and xbmc source side-by-side):
+```text
+workspace/
+  ├── vfs.stream.fast/
+  └── xbmc/  <-- Clone Kodi source code here
+```
+
+Build commands:
 
 ```bash
+# 1. Prepare directory structure (if you haven't cloned Kodi yet)
+cd ..
+git clone https://github.com/xbmc/xbmc.git
+cd vfs.stream.fast
+
+# 2. Build
 mkdir build
 cd build
-cmake .. -DCMAKE_TOOLCHAIN_FILE=[path to vcpkg]/scripts/buildsystems/vcpkg.cmake
-cmake --build .
+# If xbmc source is not in ../xbmc, specify it via -DKODI_SOURCE_DIR=/path/to/xbmc
+cmake .. -DCMAKE_TOOLCHAIN_FILE=[path/to/vcpkg]/scripts/buildsystems/vcpkg.cmake
+cmake --build . --config Release
 ```
 
 ## About STRM files
