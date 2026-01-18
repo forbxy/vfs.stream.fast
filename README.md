@@ -37,6 +37,23 @@ cmake .. -DCMAKE_TOOLCHAIN_FILE=[path to vcpkg]/scripts/buildsystems/vcpkg.cmake
 cmake --build .
 ```
 
+## About STRM files
+
+1. **URL Path Requirements**
+   The URL path inside the `.strm` file must end with the file extension; otherwise, ISO playback will fail. Standard WebDAV URLs are recommended.
+
+   *   ❌ `https://115.com/storage/linkshared` (No extension at the end of path)
+   *   ❌ `https://115.com/storage/linkshared?file=1.iso` (Extension is in query parameters, invalid)
+   *   ✅ `https://115.com/storage/linkshared.iso` (Correct)
+   *   ✅ `https://115.com/storage/linkshared.iso?a=b&c=d` (Correct)
+
+   **Summary**: The part of the URL before the question mark (if any) must contain the file extension. This is a limitation of Kodi's plugin architecture and cannot be bypassed.
+
+2. **Subtitle Scanning & Playback Stalling**
+   For a URL like `https://115.com/storage/linkshared.iso?a=b&c=d`, Kodi will attempt to access the parent directory `https://115.com/storage/` to scan for subtitles.
+   If the server does not handle this directory request correctly (e.g., returns the full file content instead of a listing), it may cause playback to stall after the Blu-ray menu.
+   **Workaround**: You can bypass this issue by choosing "Play main title" instead of "Show simplified menu".
+
 ## License
 
 This software is licensed under the [GNU General Public License v2+ (GPL-2.0-or-later)](LICENSE.txt), consistent with the Kodi project itself.
