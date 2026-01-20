@@ -867,7 +867,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
 
 bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
 {
-    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Open() URL: %s", url.GetURL().c_str());
+    kodi::Log(ADDON_LOG_INFO, "FastVFS: 正在打开文件: %s", url.GetURL().c_str());
     m_file_url = url.GetURL();
 
     // [Fix] Url Cleaning: Remove Kodi options (after '|')
@@ -957,7 +957,7 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
     }
 
 
-    kodi::Log(ADDON_LOG_INFO, "FastVFS: 打开文件成功 (Open success), 大小: %lld. Buffer=%zu", m_total_size, m_ring_buffer_size);
+    kodi::Log(ADDON_LOG_INFO, "FastVFS: 打开文件成功 (Open success), 大小: %lld. Buffer=%zu. URL: %s", m_total_size, m_ring_buffer_size, m_file_url.c_str());
 
     // 初始化基础状态
     m_logical_position = 0;

@@ -5,21 +5,21 @@
             <group id="1" label="30001">
                 <setting id="head_size" type="integer" label="30002">
                     <level>0</level>
-                    <default>30</default>
+                    <default>32</default>
                     <constraints>
-                        <minimum>10</minimum>
+                        <minimum>8</minimum>
                         <maximum>100</maximum>
-                        <step>5</step>
+                        <step>4</step>
                     </constraints>
                     <control type="slider" format="integer" />
                 </setting>
                 <setting id="tail_size" type="integer" label="30003">
                     <level>0</level>
-                    <default>30</default>
+                    <default>32</default>
                     <constraints>
-                        <minimum>10</minimum>
+                        <minimum>8</minimum>
                         <maximum>100</maximum>
-                        <step>5</step>
+                        <step>4</step>
                     </constraints>
                     <control type="slider" format="integer" />
                 </setting>
@@ -27,9 +27,9 @@
                     <level>0</level>
                     <default>20</default>
                     <constraints>
-                        <minimum>10</minimum>
+                        <minimum>8</minimum>
                         <maximum>100</maximum>
-                        <step>5</step>
+                        <step>4</step>
                     </constraints>
                     <control type="slider" format="integer" />
                 </setting>
@@ -37,19 +37,19 @@
                     <level>0</level>
                     <default>100</default>
                     <constraints>
-                        <minimum>50</minimum>
+                        <minimum>20</minimum>
                         <maximum>1024</maximum>
-                        <step>5</step>
+                        <step>4</step>
                     </constraints>
                     <control type="slider" format="integer" />
                 </setting>
                 <setting id="history_size" type="integer" label="30006">
                     <level>0</level>
-                    <default>10</default>
+                    <default>8</default>
                     <constraints>
                         <minimum>0</minimum>
                         <maximum>512</maximum>
-                        <step>5</step>
+                        <step>4</step>
                     </constraints>
                     <control type="slider" format="integer" />
                 </setting>
