@@ -36,3 +36,7 @@ msgstr "Min File Size to Preload (GB)"
 msgctxt "#30008"
 msgid "Enable Cache Only for ISO"
 msgstr "Enable Cache Only for ISO"
+
+msgctxt "#30009"
+msgid "Fast Timeout Mode"
+msgstr "Fast Timeout Mode"

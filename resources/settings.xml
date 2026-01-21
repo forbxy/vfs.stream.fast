@@ -68,6 +68,11 @@
                     <default>true</default>
                     <control type="toggle" />
                 </setting>
+                <setting id="fail_fast" type="boolean" label="30009">
+                    <level>0</level>
+                    <default>false</default>
+                    <control type="toggle" />
+                </setting>
             </group>
         </category>
     </section>

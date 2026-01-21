@@ -57,6 +57,19 @@ public:
     std::atomic<bool> m_disable_static_caches{false};
     std::atomic<int64_t> m_accumulated_download_bytes{0};
 
+    // -----------------------------------------------------------------------
+    // Network Timeouts & Limits
+    // -----------------------------------------------------------------------
+    long m_net_connect_timeout_sec = 10;
+    long m_net_low_speed_time_sec = 15;
+    long m_net_worker_low_speed_time_sec = 15; // [New] Worker 专用低速阈值
+    long m_net_read_timeout_sec = 20; // [Fix] 提高到20秒，必须大于 LowSpeedTime(15s)，否则低速逻辑无效
+    
+    // For DownloadRange (Probe/Cache)
+    long m_net_range_total_timeout_sec = 20;
+    
+    int m_net_max_retries = 5;
+
 protected:
     // 工作线程入口
     void WorkerThread();
@@ -79,7 +92,13 @@ protected:
     static size_t CacheWriteCallback(void *contents, size_t size, size_t nmemb, void *userp);
 
     // 内部辅助
-    void SetupCurlOptions(CURL *curl, bool headOnly, int64_t startPos = 0);
+    void SetupBaseCurlOptions(CURL* curl, const std::string& target_url);
+    void SetupStatWebDavOptions(CURL* curl, const std::string& target_url, struct curl_slist** headers_out);
+    void SetupStatHeadOptions(CURL* curl, const std::string& target_url);
+    void SetupStatGetFallbackOptions(CURL* curl, const std::string& target_url);
+    void SetupDownloadRangeOptions(CURL* curl, const std::string& target_url, int64_t start, int64_t length);
+    void SetupWorkerDownloadOptions(CURL* curl, const std::string& target_url, int64_t start);
+
     static void UpdateRedirectCacheFromCurl(CURL* curl, const std::string& original_url, const char* context_name, CCurlBuffer* self = nullptr);
     static std::string GetFileExtensionFromUrl(const std::string& url); // [New] Get Extension Helper
 

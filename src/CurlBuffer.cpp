@@ -11,11 +11,6 @@
 #include <map>
 #include <sstream>
 
-// 定义一些常量
-static const int MAX_RETRIES = 10;
-static const int CONNECT_TIMEOUT = 10;
-static const int READ_TIMEOUT = 30;
-
 // -----------------------------------------------------------------------------------------
 // 全局数据缓存 (Head & Tail)
 // -----------------------------------------------------------------------------------------
@@ -122,23 +117,6 @@ static std::string GetUserAgent()
     // Use Kodi's API to get the exact native User-Agent string
     // This ensures we match 'Kodi/21.2 (Windows NT ...)' exactly
     return kodi::network::GetUserAgent();
-}
-
-// 简单的 Base64 编码实现 (避免依赖 kodi::tools 导致链接问题)
-static std::string SimpleBase64Encode(const std::string &in) {
-    std::string out;
-    int val=0, valb=-6;
-    for (unsigned char c : in) {
-        val = (val<<8) + c;
-        valb += 8;
-        while (valb>=0) {
-            out.push_back("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[(val>>valb)&0x3F]);
-            valb-=6;
-        }
-    }
-    if (valb>-6) out.push_back("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[((val<<8)>>(valb+8))&0x3F]);
-    while (out.size()%4) out.push_back('=');
-    return out;
 }
 
 // [New] 获取文件扩展名函数 (使用 libcurl URL API 解析)
@@ -271,16 +249,31 @@ void CCurlBuffer::UpdateRedirectCacheFromCurl(CURL* curl, const std::string& ori
         if (original_url != effective_url_str)
         {
              // 1. 更新全局跳转缓存: A -> B
+             bool is_new_redirect = false;
              {
                  std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
-                 // [Fix] 保存带有时间戳的缓存条目
-                 RedirectCacheEntry entry;
-                 entry.target_url = effective_url_str;
-                 entry.timestamp = time(NULL);
-                 g_redirect_cache[original_url] = entry;
+                 
+                 // [Fix] 检查是否已存在相同的跳转记录
+                 auto it = g_redirect_cache.find(original_url);
+                 if (it != g_redirect_cache.end() && it->second.target_url == effective_url_str)
+                 {
+                     return; 
+                 }
+                 else
+                 {
+                     // 不存在或目标改变，写入新记录
+                     RedirectCacheEntry entry;
+                     entry.target_url = effective_url_str;
+                     entry.timestamp = time(NULL);
+                     g_redirect_cache[original_url] = entry;
+                     is_new_redirect = true;
+                 }
              }
              
-             kodi::Log(ADDON_LOG_DEBUG, "FastVFS: %s 检测到跳转: %s -> %s (Added to Cache)", context_name, original_url.c_str(), effective_url_str.c_str());
+             if (is_new_redirect)
+             {
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: %s 检测到跳转: %s -> %s (Added to Cache)", context_name, original_url.c_str(), effective_url_str.c_str());
+             }
 
              // [New] 如果发生了跳转，尝试从最终响应中获取正确的文件大小
              if (self)
@@ -425,9 +418,9 @@ static void FixDoubleEncoding(std::string& url)
 
 bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
 {
-    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 调用 Stat(), URL=%s", url.GetURL().c_str());
     m_file_url = url.GetURL();
-
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 调用 Stat(), URL=%s", m_file_url.c_str());
+    
     // [Fix] Url Cleaning: Remove Kodi options (after '|')
     // libcurl 不处理 '|' 及其后的选项，直接发给服务器会导致 400 或 插件崩溃
     size_t pipe_pos = m_file_url.find('|');
@@ -490,13 +483,13 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                 m_mod_time = entry.mod_time;
                 m_access_time = entry.access_time;
                 m_is_directory = entry.is_dir;
-                // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Cache HIT (Size: %lld): %s", m_total_size, m_file_url.c_str());
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Cache HIT (Size: %lld): %s", m_total_size, m_file_url.c_str());
                 return true;
             }
         }
     }
 
-    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件属性 (Stat) URL: %s", m_file_url.c_str());
+    // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件属性 (Stat) URL: %s", m_file_url.c_str());
 
     // 初始化通用变量
     bool success = false;
@@ -509,6 +502,13 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     
     // 重置 Handle
     curl_easy_reset(curl);
+    
+    // [Fix] Resolve URL for Stat if ISO
+    std::string target_url = m_file_url;
+    if (m_is_iso) {
+        target_url = ResolveRedirectUrl(m_file_url);
+    }
+
     bool isWebDav = (m_file_url.rfind("dav://", 0) == 0) || (m_file_url.rfind("davs://", 0) == 0);
     // =========================================================================
     // 策略分支: WebDAV (PROPFIND) vs HTTP (HEAD)
@@ -520,28 +520,46 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         // WebDAV 专用路径: 使用 PROPFIND Depth: 0 获取属性
         // -------------------------------------------------------------
         
-        SetupCurlOptions(curl, false); // 非 HeadOnly，因为我们需要读取 Body (XML)
-        
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PROPFIND");
-        curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
-        curl_easy_setopt(curl, CURLOPT_RANGE, NULL); 
-        
         struct curl_slist *headers = NULL;
-        headers = curl_slist_append(headers, "Depth: 0");
-        // Authorization 已由 SetupCurlOptions 处理 (CURLOPT_USERNAME/PASSWORD)
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
         std::string resp_body;
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](void* buffer, size_t size, size_t nmemb, void* userp) -> size_t {
-            std::string* s = (std::string*)userp;
-            s->append((char*)buffer, size * nmemb);
-            return size * nmemb;
-        });
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_body);
+        int retries = 0;
+        char errbuf[CURL_ERROR_SIZE];
+
+        while (retries < m_net_max_retries)
+        {
+            curl_easy_reset(curl);
+            resp_body.clear();
+            headers = NULL; // Reset headers pointer
+            errbuf[0] = 0;
+
+            // 设置错误信息缓冲区
+            curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+
+            SetupStatWebDavOptions(curl, target_url, &headers);
+
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](void* buffer, size_t size, size_t nmemb, void* userp) -> size_t {
+                std::string* s = (std::string*)userp;
+                s->append((char*)buffer, size * nmemb);
+                return size * nmemb;
+            });
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_body);
         
-        res = curl_easy_perform(curl);
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-        curl_slist_free_all(headers);
+            res = curl_easy_perform(curl);
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+            curl_slist_free_all(headers);
+            headers = NULL;
+
+            if (res == CURLE_OK) break;
+
+            if (res == CURLE_OPERATION_TIMEDOUT) {
+                 kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat WebDAV Timeout/LowSpeed. Retry %d/%d. Detail: %s", retries+1, m_net_max_retries, errbuf);
+            } else {
+                 kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat WebDAV Error %d. Retry %d/%d. Detail: %s", res, retries+1, m_net_max_retries, errbuf);
+                 { std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url); }
+            }
+            retries++;
+            if (retries < m_net_max_retries) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
 
         // --- Debug Log 插入 ---
         if (res != CURLE_OK || (response_code != 200 && response_code != 207))
@@ -565,7 +583,8 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
              std::transform(body_lower.begin(), body_lower.end(), body_lower.begin(), ::tolower);
              
              // 1. 检查是否为目录
-             if (body_lower.find(":collection/>") != std::string::npos || body_lower.find("<collection/>") != std::string::npos) {
+             if (body_lower.find(":collection/>") != std::string::npos || body_lower.find("<collection/>") != std::string::npos) 
+             {
                  m_is_directory = true;
                  final_size = 0;
              } else {
@@ -606,13 +625,33 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         // -------------------------------------------------------------
         // HTTP/HTTPS 通用路径: 使用 HEAD 请求
         // -------------------------------------------------------------
-        
-        SetupCurlOptions(curl, true); // Head Only模式 (设置 CURLOPT_NOBODY)
-        // curl_easy_setopt(curl, CURLOPT_RANGE, "0-0");
-        curl_easy_setopt(curl, CURLOPT_FILETIME, 1L); // 让 libcurl 处理时间
+        int retries = 0;
+        char errbuf[CURL_ERROR_SIZE];
 
-        res = curl_easy_perform(curl);
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+        while (retries < m_net_max_retries)
+        {
+            curl_easy_reset(curl);
+            errbuf[0] = 0;
+            
+            // 设置错误信息缓冲区
+            curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+            
+            SetupStatHeadOptions(curl, target_url);
+
+            res = curl_easy_perform(curl);
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+
+            if (res == CURLE_OK) break;
+
+            if (res == CURLE_OPERATION_TIMEDOUT) {
+                 kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat HEAD Timeout/LowSpeed. Retry %d/%d. Detail: %s", retries+1, m_net_max_retries, errbuf);
+            } else {
+                 kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat HEAD Error %d. Retry %d/%d. Detail: %s", res, retries+1, m_net_max_retries, errbuf);
+                 { std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url); }
+            }
+            retries++;
+            if (retries < m_net_max_retries) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
 
         // 使用 libcurl header API 解析
         struct curl_header *h = NULL;
@@ -733,10 +772,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat HEAD failed or Size=0 (%ld). Fallback to GET 0-1...", response_code);
                     
                     curl_easy_reset(curl);
-                    SetupCurlOptions(curl, false); // 不是 HEAD
-                    curl_easy_setopt(curl, CURLOPT_RANGE, "0-1"); 
-                    // 不要 WriteCallback，只要头信息
-                    curl_easy_setopt(curl, CURLOPT_NOBODY, 0L); // 需要 Body
+                    SetupStatGetFallbackOptions(curl, target_url);
 
                     // [Safety] 必须防止服务器忽略 Range 直接发送全量文件 (返回 200 OK)
                     // 如果是这样，curl_easy_perform 会一直下载直到文件结束，导致卡死
@@ -855,7 +891,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
             }
             else
             {
-               kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat Error. CurCode=%d, HTTP=%ld (Not Cached, allowing retry)", res, response_code);
+               kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat Error. CurCode=%d, HTTP=%ld, URL=%s (Not Cached, allowing retry)", res, response_code, m_file_url.c_str());
             }
             success = false;
         }
@@ -1193,103 +1229,97 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
 {
     if (!curl) return false;
 
-    // 复用 SetupCurlOptions 的部分逻辑，但需要手动设置 WriteFunction
-    // 同样使用 ResolveRedirectUrl 确保预热请求也是最新的
-    std::string target_url = m_file_url;
-    if (m_is_iso)
-    {
-        target_url = ResolveRedirectUrl(m_file_url);
-    }
-    
-    curl_easy_setopt(curl, CURLOPT_URL, target_url.c_str());
-
-    // [Fix] 鉴权逻辑：仅当 Target URL 与 Original URL 同源（或未发生跨域跳转）时才发送 Basic Auth
-    // 如果跳转到了 CDN (如 115 302 -> aliyun/tianyi signed url)，加上 Authorization 头会导致 400 Bad Request
-    bool should_send_auth = true;
-    if (target_url != m_file_url)
-    {
-        std::string host_origin = ExtractHost(m_file_url);
-        std::string host_target = ExtractHost(target_url);
-        if (!host_origin.empty() && !host_target.empty() && host_origin != host_target)
-        {
-             should_send_auth = false;
-            //  kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 跨域跳转检测 (%s -> %s), 禁用 Basic Auth", host_origin.c_str(), host_target.c_str());
-        }
-    }
-
-    if (!m_username.empty() && should_send_auth)
-    {
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-        curl_easy_setopt(curl, CURLOPT_USERNAME, m_username.c_str());
-        curl_easy_setopt(curl, CURLOPT_PASSWORD, m_password.c_str());
-    }
-    else
-    {
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
-    }
-    
-    // 设置 User-Agent (模仿 Kodi 原生 behavior)
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, GetUserAgent().c_str());
-    // [Fix] 全局禁用压缩 (identity) 以避免 gzip 干扰 range 下载
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
-    // 模仿 Kodi 默认禁用 Auto Referer
-    curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 0L);
-
-    // 启用调试回调以打印请求头 (排查 403 问题)
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-    curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, DebugCallback);
-    
-    // 基本设置
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L); // 预热超时短一点: 5秒连不上就算了
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);       // 增加一点超时时间
-    
-    // 设置 Range
-    std::string range = std::to_string(start) + "-" + std::to_string(start + length - 1);
-    curl_easy_setopt(curl, CURLOPT_RANGE, range.c_str());
-    
-    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: DownloadRange 发送 Range: bytes=%s (Expect %lld bytes)", range.c_str(), length);
-
-    // 设置回调
-    CacheContext ctx;
-    ctx.buffer = &buffer;
-    ctx.offset = 0;
-    ctx.limit = buffer.size(); // 确保安全
-    
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CCurlBuffer::CacheWriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
-
-    CURLcode res = curl_easy_perform(curl);
-    
-    // 简单的错误处理
+    int retries = 0;
+    CURLcode res = CURLE_FAILED_INIT;
     long response_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-    
-    if (res == CURLE_OK)
-    {
-        // ---------------------------------------------------------
-        // Update Redirect Cache (如果发生了跳转)
-        // ---------------------------------------------------------
-        UpdateRedirectCacheFromCurl(curl, m_file_url, "DownloadRange", this);
-    }
+    CacheContext ctx;
+    char errbuf[CURL_ERROR_SIZE];
 
-    if (res == CURLE_OK && (response_code >= 200 && response_code < 300))
+    while (retries < m_net_max_retries)
     {
-        // 只要 HTTP Code 正确，我们就认为 OK
-        // [安全修正] 如果下载的数据少于预期 (Short Read)，必须调整 buffer 大小，
-        // 否则 Read() 会读取到 buffer 末尾填充的 0，导致数据错误。
-        if (ctx.offset < buffer.size())
+        // 复用 SetupCurlOptions 的部分逻辑，但需要手动设置 WriteFunction
+        // 同样使用 ResolveRedirectUrl 确保预热请求也是最新的
+        // [Retry] 每次重试前重置 handle 状态
+        curl_easy_reset(curl);
+        errbuf[0] = 0;
+        
+        // 设置错误信息缓冲区
+        curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+
+        std::string target_url = m_file_url;
+        if (m_is_iso)
         {
-            kodi::Log(ADDON_LOG_WARNING, "FastVFS: DownloadRange Short Read. Check: %zu < %zu", ctx.offset, buffer.size());
-            buffer.resize(ctx.offset);
+            target_url = ResolveRedirectUrl(m_file_url);
         }
-        return true;
+    
+        // Use new helper
+        SetupDownloadRangeOptions(curl, target_url, start, length);
+
+        if (retries == 0) // Reduce log spam
+        {
+            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: DownloadRange 发送 Range: bytes=%lld-%lld (Expect %lld bytes)", 
+                start, start + length - 1, length);
+        }
+        else
+        {
+             kodi::Log(ADDON_LOG_DEBUG, "FastVFS: DownloadRange Retry %d/%d. Range: %lld-%lld", 
+                retries, m_net_max_retries, start, start + length - 1);
+        }
+
+        // 设置回调
+        ctx.buffer = &buffer;
+        ctx.offset = 0;
+        ctx.limit = buffer.size(); // 确保安全
+    
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CCurlBuffer::CacheWriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+
+        res = curl_easy_perform(curl);
+        
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+    
+        if (res == CURLE_OK)
+        {
+            // ---------------------------------------------------------
+            // Update Redirect Cache (如果发生了跳转)
+            // ---------------------------------------------------------
+            UpdateRedirectCacheFromCurl(curl, m_file_url, "DownloadRange", this); // will use this->m_total_size
+
+            // 检查 HTTP Code
+            if (response_code >= 200 && response_code < 300)
+            {
+                // [安全修正] 如果下载的数据少于预期 (Short Read)，必须调整 buffer 大小
+                if (ctx.offset < buffer.size())
+                {
+                    kodi::Log(ADDON_LOG_WARNING, "FastVFS: DownloadRange Short Read. Check: %zu < %zu", ctx.offset, buffer.size());
+                    buffer.resize(ctx.offset);
+                }
+                return true; // Success!
+            }
+        }
+        
+        // Error handling for Retry
+        if (res == CURLE_OPERATION_TIMEDOUT)
+        {
+              kodi::Log(ADDON_LOG_WARNING, "FastVFS: DownloadRange Low Speed/Timeout. Retry... (%d/%d). Detail: %s", retries + 1, m_net_max_retries, errbuf);
+        }
+        else
+        {
+              kodi::Log(ADDON_LOG_ERROR, "FastVFS: DownloadRange 失败. Code=%d, HTTP=%ld. Retry (%d/%d). Detail: %s", res, response_code, retries + 1, m_net_max_retries, errbuf);
+              // 对于非超时错误，可能需要清除 Redirect Cache
+              {
+                  std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
+                  g_redirect_cache.erase(m_file_url);
+              }
+        }
+
+        retries++;
+        if (retries < m_net_max_retries)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
     }
     
-    kodi::Log(ADDON_LOG_ERROR, "FastVFS: DownloadRange 失败. Code=%d, HTTP=%ld", res, response_code);
     return false;
 }
 
@@ -1322,6 +1352,7 @@ void CCurlBuffer::WorkerThread()
     if (!curl) return;
     
     int retries = 0;
+    char errbuf[CURL_ERROR_SIZE];
 
     while (m_is_running)
     {
@@ -1376,13 +1407,15 @@ void CCurlBuffer::WorkerThread()
         
         // 每次循环（重新发起请求前）重置 Handle 状态
         curl_easy_reset(curl);
+        errbuf[0] = 0;
+        curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
-        SetupCurlOptions(curl, false, m_download_position);
-        
-        // [关键] 启用基于信号的中断回调 (Signal-based Abort)
-        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, WorkerProgressCallback);
-        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, this);
+        std::string target_url = m_file_url;
+        if (m_is_iso) {
+            target_url = ResolveRedirectUrl(m_file_url);
+        }
+
+        SetupWorkerDownloadOptions(curl, target_url, m_download_position);
         
         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Worker 开始下载. Pos: %lld", m_download_position.load());
 
@@ -1390,7 +1423,7 @@ void CCurlBuffer::WorkerThread()
         
         if (res != CURLE_OK)
         {
-             kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Worker 下载结束 (Error/Aborted). Res: %d", res);
+             kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Worker 下载结束 (Error/Aborted). Res: %d. Detail: %s", res, errbuf);
         }
 
         // ---------------------------------------------------------
@@ -1441,7 +1474,15 @@ void CCurlBuffer::WorkerThread()
         }
         else
         {
-            kodi::Log(ADDON_LOG_ERROR, "FastVFS: Curl 错误: %d. 重试 %d/%d", res, retries, MAX_RETRIES);
+             // [New] 针对低速/超时错误的专门处理
+            if (res == CURLE_OPERATION_TIMEDOUT)
+            {
+                kodi::Log(ADDON_LOG_WARNING, "FastVFS: Worker Low Speed/Timeout. Retry... (%d/%d)", retries + 1, m_net_max_retries);
+            }
+            else
+            {
+                kodi::Log(ADDON_LOG_ERROR, "FastVFS: Curl 错误: %d. 重试 %d/%d", res, retries, m_net_max_retries);
+            }
 
             // [New] 发生错误时清除 302 缓存，确保重试时使用原始 URL
             // 这可以防止因为 CDN 链接过期 (403/410) 或 IP 变动导致的持续错误
@@ -1480,7 +1521,7 @@ void CCurlBuffer::WorkerThread()
             }
 
             retries++;
-            if (retries > MAX_RETRIES)
+            if (retries > m_net_max_retries)
             {
                 m_has_error = true;
                 m_cv_reader.notify_all();
@@ -1502,44 +1543,23 @@ void CCurlBuffer::WorkerThread()
 
 // (Function ProgressCallback removed as it is superseded by WorkerProgressCallback)
 
-void CCurlBuffer::SetupCurlOptions(CURL *curl, bool headOnly, int64_t startPos)
+void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url)
 {
-    // 移除全局的中断回调设置，避免影响 Stat/Preload (它们运行时 is_running=false)
+    // Common settings
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); // Multithreading safety
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, NULL);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, NULL);
     
-    // 设置 User-Agent (模仿 Kodi 原生 behavior)
     curl_easy_setopt(curl, CURLOPT_USERAGENT, GetUserAgent().c_str());
-
-    // [Fixed] 全局禁用压缩 (identity)
-    // 1. 确保 Stat (HEAD) 能拿到真实文件大小
-    // 2. 避免 Range 下载时服务器返回压缩流导致 seek 失败
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
-    
-    // 模仿 Kodi 默认禁用 Auto Referer (模拟 ffmpeg/browser 行为)
     curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 0L);
-
-    // 启用调试回调以打印请求头
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
     curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
     curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, DebugCallback);
 
-    // B. 策略调整：下载阶段使用解析后的 URL
-    // 在这里进行最终的 URL 解析，递归查找最新的有效地址
-    std::string target_url = m_file_url;
-    
-    if (m_is_iso)
-    {
-        target_url = ResolveRedirectUrl(m_file_url);
-    }
-    
-    if (target_url != m_file_url) {
-        // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: URL Resolved: %s -> %s", m_file_url.c_str(), target_url.c_str());
-    }
+    // URL & Auth
     curl_easy_setopt(curl, CURLOPT_URL, target_url.c_str());
 
-    // [Fix] 鉴权逻辑：仅当 Target URL 与 Original URL 同源（或未发生跨域跳转）时才发送 Basic Auth
     bool should_send_auth = true;
     if (target_url != m_file_url)
     {
@@ -1551,8 +1571,6 @@ void CCurlBuffer::SetupCurlOptions(CURL *curl, bool headOnly, int64_t startPos)
         }
     }
 
-    // 只要有用户名，就默认使用 Basic Auth 并强制预先发送 Header
-    // 这是为了满足 "直接构造 Basic Auth 头" 的需求，避免等待 401 质询
     if (!m_username.empty() && should_send_auth)
     {
         curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
@@ -1564,43 +1582,83 @@ void CCurlBuffer::SetupCurlOptions(CURL *curl, bool headOnly, int64_t startPos)
         curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
     }
 
+    // SSL & Redirects
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-    if (headOnly)
-    {
-        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-    }
 
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, CONNECT_TIMEOUT);
-
-    // [New] 启用 TCP Keepalive 防止僵尸连接及长暂停挂起
-    // 如果服务器默默掐掉连接 (Zombie Connection)，探测失败会报错返回，而不是导致 recv() 无限挂起
-    // 缩短探测间隔以便更快发现僵尸连接/断开
+    // Network & Timeouts
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, m_net_connect_timeout_sec);
+    
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 15L);  // 空闲 15s 后开始探测
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 5L);  // 每 5s 探测一次
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 15L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 5L);
 
-    // 如果连接在短时间内无数据，认为是“低速/挂起”并自动断开以加速重试/退出
-    // 这样在 Close() 时能更快触发 WorkerProgressCallback -> 中断 curl
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L); // bytes/second
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 10L); // seconds
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, m_net_low_speed_time_sec);
+}
 
-    if (!headOnly)
-    {
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CCurlBuffer::WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, this);
-        // 512k buffer size for curl internal
-        curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 512 * 1024);
+void CCurlBuffer::SetupStatWebDavOptions(CURL* curl, const std::string& target_url, struct curl_slist** headers_out)
+{
+    SetupBaseCurlOptions(curl, target_url);
 
-        curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)startPos);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PROPFIND");
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 0L); // Need Body
+    curl_easy_setopt(curl, CURLOPT_RANGE, NULL); 
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, m_net_read_timeout_sec);
+
+    if (headers_out) {
+        *headers_out = curl_slist_append(*headers_out, "Depth: 0");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, *headers_out);
     }
-    else
-    {
-        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-        curl_easy_setopt(curl, CURLOPT_HEADER, 0L);
-    }
+}
+
+void CCurlBuffer::SetupStatHeadOptions(CURL* curl, const std::string& target_url)
+{
+    SetupBaseCurlOptions(curl, target_url);
+    
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_HEADER, 0L); // We read headers via api
+    curl_easy_setopt(curl, CURLOPT_FILETIME, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, m_net_read_timeout_sec);
+}
+
+void CCurlBuffer::SetupStatGetFallbackOptions(CURL* curl, const std::string& target_url)
+{
+    SetupBaseCurlOptions(curl, target_url);
+
+    curl_easy_setopt(curl, CURLOPT_RANGE, "0-1"); 
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, m_net_read_timeout_sec);
+}
+
+void CCurlBuffer::SetupDownloadRangeOptions(CURL* curl, const std::string& target_url, int64_t start, int64_t length)
+{
+    SetupBaseCurlOptions(curl, target_url);
+
+    // Probe specific timeouts
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, m_net_range_total_timeout_sec);
+    
+    std::string range = std::to_string(start) + "-" + std::to_string(start + length - 1);
+    curl_easy_setopt(curl, CURLOPT_RANGE, range.c_str());
+}
+
+void CCurlBuffer::SetupWorkerDownloadOptions(CURL* curl, const std::string& target_url, int64_t start)
+{
+    SetupBaseCurlOptions(curl, target_url);
+
+    // [New] 使用 Worker 专用的低速时间参数覆盖 Base 设置
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, m_net_worker_low_speed_time_sec);
+
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, WorkerProgressCallback);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, this);
+    
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CCurlBuffer::WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, this);
+    curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 512 * 1024);
+    curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)start);
 }
 
 size_t CCurlBuffer::WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
@@ -1868,9 +1926,6 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
 
     bool need_reset = false;
 
-    // [New] 本次 Read 调用的超时重试计数
-    int timeout_retry_count = 0;
-
     // 情况 A: 落后 (Lag) - 数据已被覆盖
     if (m_logical_position < buffer_valid_start)
     {
@@ -1948,42 +2003,19 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
             
             // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read Waiting... (Pos: %lld, BufStart: %lld, BufEnd: %lld)", m_logical_position, buf_start, buf_end);
 
-            // [Fix] 增加等待超时保护 (10秒)
-            // 如果 10 秒内 Worker 没填上数据 (Gap 填充太慢，或死锁)，强制重试
-            if (m_cv_reader.wait_for(lock, std::chrono::seconds(15)) == std::cv_status::timeout)
+            // [Fix] 增加等待超时保护 (改为60秒，不做主动重置)
+            // 原逻辑：15秒超时后会主动触发 Worker 重置 (Seek 重连)
+            // 新逻辑：等待 60 秒，如果还等不到直接报错。网络层的重连交给 Worker 自己处理。
+            if (m_cv_reader.wait_for(lock, std::chrono::seconds(60)) == std::cv_status::timeout)
             {
-                timeout_retry_count++;
-                kodi::Log(ADDON_LOG_WARNING, "FastVFS: Read 等待超时 (15s). Retry: %d/3. Req: %lld", timeout_retry_count, m_logical_position);
-                
-                if (timeout_retry_count >= 3)
-                {
-                    kodi::Log(ADDON_LOG_ERROR, "FastVFS: Read 连续超时失败，放弃重试。");
-                    m_has_error = true; // 标记错误，避免后续死循环
-                    
-                    // 如果已经读到了一些数据，返回它，让 Kodi 决定是否重试
-                    // 否则返回错误 -1
-                    return total_read > 0 ? total_read : -1;
-                }
-
-                m_reset_target_pos = m_logical_position;
-                m_trigger_reset = true;
-                m_abort_transfer = true;
-                
-                // 唤醒 Worker 处理重置
-                m_cv_writer.notify_all(); 
-
-                // [Fix] 显式清除状态，确保 continue 后不会因为旧状态退出循环
-                m_has_error = false;
-                m_is_eof = false;
-                
-                // 此时虽然 timeout 了，但我们不能直接 return error
-                // 而是 continue 回去，下一次 loop 会检测到 m_trigger_reset 为 true (或者 worker 已经响应并开始了)
-                // 这里的 continue 会重新计算 avail_in_buffer，仍然 <= 0，然后再次 wait，但这次 wait 会被 worker 的 notify 唤醒
-                continue;
+                kodi::Log(ADDON_LOG_ERROR, "FastVFS: Read 严重超时 (60s). 缓冲区无数据，强制返回错误 (-1) 以中断播放。");
+                // 强制返回 -1，即使之前可能读到了一点点数据也不返回了，直接让播放器报错更干脆
+                return -1; 
             }
 
-            // 成功被唤醒 (收到数据, 或 Error, 或 EOF)，重置超时计数
-            timeout_retry_count = 0;
+            // 被 Worker 唤醒（或有错误/EOF）
+            if (m_has_error) return -1;
+            if (m_is_eof && m_rb_bytes_available == 0) return total_read; // 双重检查
 
             // 唤醒后重新检查状态
             if (!m_is_running) return -1; // 发生重连或停止
