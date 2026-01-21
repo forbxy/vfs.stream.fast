@@ -36,7 +36,7 @@ public:
   bool IoControlGetSeekPossible(kodi::addon::VFSFileHandle context) override { return true; }
   
   // 告诉 Kodi 我们想要大块读取 (虽然 Kodi 内部通过 CDVDInputStream 可能会自己分片，但也是一种暗示)
-  int GetChunkSize(kodi::addon::VFSFileHandle context) override { return 4 * 1024 * 1024; }
+  int GetChunkSize(kodi::addon::VFSFileHandle context) override { return 1024 * 1024; }
 };
 
 // ---------------------------------------------------------------------------
