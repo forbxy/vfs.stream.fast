@@ -1604,6 +1604,13 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 15L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 5L);
 
+    // Optimize TCP Window Strategy
+    // Disable Nagle's algorithm for lower latency
+    curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
+    // Increase buffer size to 256KB (default is 16KB, max was 512KB in old libcurl)
+    // Helps TCP window scaling for high latency high throughput (4K Remux)
+    curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 256L * 1024L);
+
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, m_net_low_speed_time_sec);
 }
