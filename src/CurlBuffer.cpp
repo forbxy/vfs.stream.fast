@@ -191,7 +191,8 @@ static void ReturnCurlHandleToPool(CURL* handle)
     }
 }
 
-static std::string ResolveRedirectUrl(const std::string& input_url)
+// [Fix] 增加 TTL 参数
+static std::string ResolveRedirectUrl(const std::string& input_url, long ttl = 14400)
 {
     std::string current = input_url;
     std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
@@ -202,8 +203,8 @@ static std::string ResolveRedirectUrl(const std::string& input_url)
         auto it = g_redirect_cache.find(current);
         if (it != g_redirect_cache.end())
         {
-            // [Fix] 检查有效期 (1小时 = 3600秒)
-            if (now - it->second.timestamp < 3600)
+            // [Fix] 检查有效期 (默认 4小时)
+            if (now - it->second.timestamp < ttl)
             {
                 if (it->second.target_url != current)
                 {
@@ -459,6 +460,12 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     // [Init] 初始化 ISO 标志
     std::string ext = GetFileExtensionFromUrl(original_url);
     m_is_iso = (ext == "iso");
+    // [Init] 初始化 Video 标志
+    m_is_video = (ext == "mkv" || ext=="iso" || ext == "mp4" || ext == "avi" || ext == "mov" ||  
+                  ext == "wmv" || ext == "flv" || ext == "webm" || ext == "m2ts" || 
+                  ext == "ts" || ext == "bdmv" || ext == "ifo" || ext == "3gp" ||
+                  ext == "rmvb" || ext =="rm" || ext == "vob" || ext == "mpg" || 
+                  ext == "mpeg" );
 
     // ---------------------------------------------------------
     // 0. 检查全局 Stat 缓存
@@ -503,10 +510,9 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     // 重置 Handle
     curl_easy_reset(curl);
     
-    // [Fix] Resolve URL for Stat if ISO
     std::string target_url = m_file_url;
-    if (m_is_iso) {
-        target_url = ResolveRedirectUrl(m_file_url);
+    if (m_is_video) {
+        target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
     }
 
     bool isWebDav = (m_file_url.rfind("dav://", 0) == 0) || (m_file_url.rfind("davs://", 0) == 0);
@@ -1247,9 +1253,9 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
         curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
         std::string target_url = m_file_url;
-        if (m_is_iso)
+        if (m_is_video)
         {
-            target_url = ResolveRedirectUrl(m_file_url);
+            target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
         }
     
         // Use new helper
@@ -1306,11 +1312,12 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
         else
         {
               kodi::Log(ADDON_LOG_ERROR, "FastVFS: DownloadRange 失败. Code=%d, HTTP=%ld. Retry (%d/%d). Detail: %s", res, response_code, retries + 1, m_net_max_retries, errbuf);
-              // 对于非超时错误，可能需要清除 Redirect Cache
-              {
-                  std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
-                  g_redirect_cache.erase(m_file_url);
-              }
+        }
+        
+        // [Fix] 无论是超时还是错误，都清除跳转缓存，确保重试时使用最新链接
+        {
+            std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
+            g_redirect_cache.erase(m_file_url);
         }
 
         retries++;
@@ -1411,8 +1418,8 @@ void CCurlBuffer::WorkerThread()
         curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
         std::string target_url = m_file_url;
-        if (m_is_iso) {
-            target_url = ResolveRedirectUrl(m_file_url);
+        if (m_is_video) {
+            target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
         }
 
         SetupWorkerDownloadOptions(curl, target_url, m_download_position);
@@ -1484,7 +1491,7 @@ void CCurlBuffer::WorkerThread()
                 kodi::Log(ADDON_LOG_ERROR, "FastVFS: Curl 错误: %d. 重试 %d/%d", res, retries, m_net_max_retries);
             }
 
-            // [New] 发生错误时清除 302 缓存，确保重试时使用原始 URL
+            // [New] 发生错误时和超时时都清除 302 缓存，确保重试时使用原始 URL
             // 这可以防止因为 CDN 链接过期 (403/410) 或 IP 变动导致的持续错误
             // 下一次 SetupCurlOptions 会重新解析，libcurl 会自动处理跳转并触发 UpdateRedirectCacheFromCurl 更新缓存
             {
@@ -1587,6 +1594,8 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+    // [Fix] Allow all redirect
+    curl_easy_setopt(curl, CURLOPT_POSTREDIR, CURL_REDIR_POST_ALL); 
 
     // Network & Timeouts
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, m_net_connect_timeout_sec);

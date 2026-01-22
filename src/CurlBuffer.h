@@ -53,6 +53,9 @@ public:
     int64_t m_cfg_preload_thresh = 10LL * 1024 * 1024 * 1024;   // <10GB 跳过预热(Preload Head/Tail)
     bool m_cfg_cache_iso_only = true; // [New] 仅 ISO 开启缓存
 
+    // 跳转记录缓存时间 (秒)
+    long m_cfg_redirect_cache_ttl_sec = 14400;
+
     // [New] 动态缓存屏蔽阈值
     std::atomic<bool> m_disable_static_caches{false};
     std::atomic<int64_t> m_accumulated_download_bytes{0};
@@ -79,6 +82,7 @@ protected:
     bool m_support_range = true;
     bool m_is_directory = false;
     bool m_is_iso = false; // [New] 标记是否为 ISO 文件
+    bool m_is_video = false; 
     time_t m_mod_time = 0;
     time_t m_access_time = 0;
 

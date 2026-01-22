@@ -70,6 +70,12 @@ kodi::addon::VFSFileHandle CClientVFS::Open(const kodi::addon::VFSUrl &url)
     }
     file->m_cfg_cache_iso_only = cache_iso_only;
 
+    // [New] 读取跳转缓存 TTL (默认 4 小时)
+    int ttl_hours = MyGetSettingInt("redirect_cache_ttl", 4);
+    if (ttl_hours > 0) {
+        file->m_cfg_redirect_cache_ttl_sec = ttl_hours * 3600;
+    }
+
     // [New] Fail Fast (Quick Timeout Reconnect)
     bool fail_fast = false;
     if (CPrivateBase::m_interface && CPrivateBase::m_interface->toKodi && CPrivateBase::m_interface->toKodi->kodi_addon) {

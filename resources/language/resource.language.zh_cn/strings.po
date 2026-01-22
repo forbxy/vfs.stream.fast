@@ -1,4 +1,4 @@
-# Kodi Media Center language file
+﻿# Kodi Media Center language file
 # Addon Name: vfs.stream.fast
 # Addon id: vfs.stream.fast
 # Addon Provider: hezi
@@ -35,8 +35,12 @@ msgstr "文件超过多大启用缓存头尾 (GB)"
 
 msgctxt "#30008"
 msgid "Enable Cache Only for ISO"
-msgstr "仅 ISO 启用缓存"
+msgstr "仅 ISO 启用头尾,JIT缓存"
 
 msgctxt "#30009"
 msgid "Fast Timeout Mode"
 msgstr "快速超时模式"
+
+msgctxt "#30010"
+msgid "Redirect Cache TTL (Hours)"
+msgstr "跳转记录缓存有效时长 (小时)"
