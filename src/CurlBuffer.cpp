@@ -652,6 +652,13 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
             if (res == CURLE_OPERATION_TIMEDOUT) {
                  kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat HEAD Timeout/LowSpeed. Retry %d/%d. Detail: %s", retries+1, m_net_max_retries, errbuf);
             } else {
+                 // [Fix] Do not retry on connection refusal (Error 7)
+                 if (res == CURLE_COULDNT_CONNECT) {
+                     kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat HEAD Failed to connect (Error 7). Aborting. Detail: %s", errbuf);
+                     { std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url); }
+                     break;
+                 }
+
                  kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat HEAD Error %d. Retry %d/%d. Detail: %s", res, retries+1, m_net_max_retries, errbuf);
                  { std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url); }
             }
