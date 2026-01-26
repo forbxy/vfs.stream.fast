@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <addon id="vfs.stream.fast"
-       version="1.2.1"
+       version="1.2.2"
        name="Fast Stream VFS"
        provider-name="forbxy">
   
