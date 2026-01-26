@@ -2020,6 +2020,39 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
 
         if (avail_in_buffer <= 0)
         {
+            // [FIX DEADLOCK]: Seek 导致的死锁修复
+            // 当 Seek 向前跳跃 (gap within plan) 时，m_logical_position 超过了 m_download_position。
+            // 此时 Reader 进入 wait (等待数据下载)。
+            // 但如果缓冲区已满 (m_rb_bytes_available == Size)，Writer 线程正阻塞在 wait(m_cv_writer) 等待空间。
+            // Reader 等 Writer，Writer 等 Reader -> 死锁。
+            // 解决方法：在 Reader 进入 wait 前，检查是否因为 Seek 跳过了旧数据，导致可以释放大量空间。
+            // 如果 "已消费+跳过" 的历史数据量 >HistorySize，则主动丢弃，释放 m_rb_bytes_available 并唤醒 Writer。
+
+            int64_t effective_history = m_logical_position - buf_start; // 从 Buffer 起始点到当前请求点的距离
+            if (effective_history > (int64_t)m_cfg_history_size)
+            {
+                size_t bytes_to_drop = (size_t)(effective_history - (int64_t)m_cfg_history_size);
+                
+                // 限制不能丢弃超过实际拥有的数据
+                if (bytes_to_drop > m_rb_bytes_available) 
+                    bytes_to_drop = m_rb_bytes_available;
+
+                if (bytes_to_drop > 0)
+                {
+                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 死锁预防 - 主动丢弃 %zu bytes (Seek Gap). Avail Before: %zu", 
+                        bytes_to_drop, m_rb_bytes_available);
+
+                    m_ring_buffer_tail = (m_ring_buffer_tail + bytes_to_drop) % m_ring_buffer_size;
+                    m_rb_bytes_available -= bytes_to_drop;
+                    
+                    // 关键: 唤醒 Writer 起来干活
+                    m_cv_writer.notify_all(); 
+                    
+                    // 重新计算 avail (虽然仍是 <=0，但 Buffer 有空间了，Writer 可以继续跑)
+                    // buf_start = m_download_position - m_rb_bytes_available; 
+                }
+            }
+
             // 数据不够，需要等待
             if (m_is_eof) return total_read; // 已经读到文件末尾
             if (m_has_error) return -1;
