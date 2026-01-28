@@ -658,6 +658,11 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                      { std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url); }
                      break;
                  }
+                 // [New] Do not retry on Empty Reply (Error 52)
+                 else if (res == CURLE_GOT_NOTHING) {
+                     kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat HEAD Error 52 (Empty Reply). Aborting retry to Fallback GET. Detail: %s", errbuf);
+                     break;
+                 }
 
                  kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat HEAD Error %d. Retry %d/%d. Detail: %s", res, retries+1, m_net_max_retries, errbuf);
                  { std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url); }
@@ -734,6 +739,16 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
             m_is_directory = false;
         }
 
+        // 提前定义 fallback 变量并检查文件类型
+        bool need_fallback = false;
+        
+        // 对 .bdmv, .IFO, .BDM 等蓝光结构及图片文件，不做 fallback
+        // 这些通常确实是小文件 且大多是kodi在频繁的扫文件夹，如果使用get，会穿透webdav缓存，直接访问源服务器，导致账号被风控
+        // FIXME 对于404的fallback是兼容emby-next-gen的无奈之举，需更加严谨的调查改进
+        std::string ext = GetFileExtensionFromUrl(m_file_url); 
+        bool is_sensitive_file = (ext == "bdmv" || ext == "ifo" || ext == "bdm" || 
+                                ext == "jpg" || ext == "png" || ext == "tbn");
+
         if (res == CURLE_OK)
         {
             if (response_code == 206)
@@ -758,14 +773,6 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                 }
             }
             
-            // 对 .bdmv, .IFO, .BDM 等蓝光结构及图片文件，不做 fallback
-            // 这些通常确实是小文件 且大多是kodi在频繁的扫文件夹，如果使用get，会穿透webdav缓存，直接访问源服务器，导致账号被风控
-            std::string ext = GetFileExtensionFromUrl(m_file_url); 
-            // GetFileExtensionFromUrl 已转小写
-            bool is_sensitive_file = (ext == "bdmv" || ext == "ifo" || ext == "bdm" || 
-                                    ext == "jpg" || ext == "png" || ext == "tbn");
-            
-             bool need_fallback = false;
              if (!is_sensitive_file)
              {
                 // 一些服务器不支持 HEAD 请求，返回 4xx 错误码
@@ -779,9 +786,15 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                     need_fallback = true;
                 }
              }
+        }
+        else if (res == CURLE_GOT_NOTHING && !is_sensitive_file)
+        {
+             kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat HEAD failed with Error 52 (Empty Reply). Server likely does not support HEAD. Fallback to GET 0-1...");
+             need_fallback = true;
+        }
 
-             if (need_fallback)
-             {
+        if (need_fallback)
+        {
                     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat HEAD failed or Size=0 (%ld). Fallback to GET 0-1...", response_code);
                     
                     curl_easy_reset(curl);
@@ -852,8 +865,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                         }
                     }
                 }
-            }
-        }
+        } // End of else (HTTP/HTTPS block)
     
 
     // ---------------------------------------------------------
@@ -990,7 +1002,9 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
     if (m_total_size <= 0)
     {
         m_ring_buffer_size = 5 * 1024 * 1024; // 5MB Conservative Buffer
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 未知长度 (0) -> RingBuffer: %zu bytes (Conservative)", m_ring_buffer_size);
+        // [Dynamic] 当长度为0时，直接将历史数据保留设置为0，防止死锁
+        m_cfg_history_size = 0;
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 未知长度 (0) -> RingBuffer: %zu bytes (Conservative), History: 0 (Disabled)", m_ring_buffer_size);
     }
     // 2. RingBuffer 大小: 若为小文件 (< 配置的 RingBuffer 大小)，Buffer 仅分配文件大小
     else if (m_total_size < (int64_t)m_cfg_ring_size)
@@ -1595,6 +1609,9 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
     {
         curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
     }
+
+    // [Fix] Allow sending credentials to redirected hosts (necessary when redirecting from Proxy to NAS with auth in URL)
+    // curl_easy_setopt(curl, CURLOPT_UNRESTRICTED_AUTH, 1L);
 
     // SSL & Redirects
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);

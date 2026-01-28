@@ -2,7 +2,29 @@
 $KodiAddonsPath = "$env:LOCALAPPDATA\Packages\XBMCFoundation.Kodi_4n2hpmxwrvr6p\LocalCache\Roaming\Kodi\addons"
 $AddonId = "vfs.stream.fast"
 $TargetDir = Join-Path $KodiAddonsPath $AddonId
-$SourceDll = "build\Debug\vfs.stream.fast.dll"
+$ReleaseDll = "build\Release\vfs.stream.fast.dll"
+$DebugDll = "build\Debug\vfs.stream.fast.dll"
+$SourceDll = $null
+
+if ((Test-Path $ReleaseDll) -and (Test-Path $DebugDll)) {
+    # Both exist, pick the newer one
+    $RelTime = (Get-Item $ReleaseDll).LastWriteTime
+    $DebTime = (Get-Item $DebugDll).LastWriteTime
+    if ($RelTime -gt $DebTime) {
+        $SourceDll = $ReleaseDll
+        Write-Host "Selected Release build (Newer)"
+    } else {
+        $SourceDll = $DebugDll
+        Write-Host "Selected Debug build (Newer)"
+    }
+} elseif (Test-Path $ReleaseDll) {
+    $SourceDll = $ReleaseDll
+} elseif (Test-Path $DebugDll) {
+    $SourceDll = $DebugDll
+} else {
+    # Neither exists, default to Release for error message purposes, or handle later
+    $SourceDll = $ReleaseDll
+}
 $SourceXml = "addon.xml"
 $SourceResources = "resources"
 
