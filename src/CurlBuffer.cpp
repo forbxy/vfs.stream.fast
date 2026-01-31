@@ -109,6 +109,23 @@ static int DebugCallback(CURL *handle, curl_infotype type, char *data, size_t si
 }
 
 // -----------------------------------------------------------------------------------------
+
+static bool IsFatalError(CURLcode res)
+{
+    static const std::vector<CURLcode> fatal_errors = {
+        CURLE_URL_MALFORMAT,
+        CURLE_COULDNT_CONNECT,
+        CURLE_SSL_CONNECT_ERROR, // Error 35: SSL handshake failed
+        CURLE_GOT_NOTHING // Empty reply, usually means server closed connection immediately, retry rarely helps for HEAD
+    };
+    
+    for (auto code : fatal_errors) {
+        if (res == code) return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------------------
 // Helper: Get User Agent mimicking Kodi's native behavior
 // -----------------------------------------------------------------------------------------
 
@@ -449,6 +466,9 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     
 
     // 协议修复: libcurl 不认识 dav://，只认识 http://
+    // [Fix] 检测 WebDAV (Check protocol before modification)
+    bool isWebDav = (m_file_url.rfind("dav://", 0) == 0) || (m_file_url.rfind("davs://", 0) == 0);
+
     if (m_file_url.rfind("dav://", 0) == 0)
         m_file_url.replace(0, 6, "http://");
     else if (m_file_url.rfind("davs://", 0) == 0)
@@ -515,58 +535,75 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
     }
 
-    bool isWebDav = (m_file_url.rfind("dav://", 0) == 0) || (m_file_url.rfind("davs://", 0) == 0);
     // =========================================================================
     // 策略分支: WebDAV (PROPFIND) vs HTTP (HEAD)
     // =========================================================================
 
-    if (isWebDav)
+    // =========================================================================
+    // 1. 统一 Stat 重试循环 (WebDAV与HTTP共用)
+    // =========================================================================
+    
+    struct curl_slist *headers = NULL;
+    std::string resp_body;
+    int retries = 0;
+    char errbuf[CURL_ERROR_SIZE];
+
+    while (retries < m_net_max_retries)
     {
-        // -------------------------------------------------------------
-        // WebDAV 专用路径: 使用 PROPFIND Depth: 0 获取属性
-        // -------------------------------------------------------------
-        
-        struct curl_slist *headers = NULL;
-        std::string resp_body;
-        int retries = 0;
-        char errbuf[CURL_ERROR_SIZE];
+        curl_easy_reset(curl);
+        errbuf[0] = 0;
+        curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
-        while (retries < m_net_max_retries)
+        if (isWebDav)
         {
-            curl_easy_reset(curl);
-            resp_body.clear();
-            headers = NULL; // Reset headers pointer
-            errbuf[0] = 0;
+             // WebDAV Setup
+             if (headers) { curl_slist_free_all(headers); headers = NULL; }
+             resp_body.clear(); 
+             
+             SetupStatWebDavOptions(curl, target_url, &headers);
 
-            // 设置错误信息缓冲区
-            curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-
-            SetupStatWebDavOptions(curl, target_url, &headers);
-
-            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](void* buffer, size_t size, size_t nmemb, void* userp) -> size_t {
+             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](void* buffer, size_t size, size_t nmemb, void* userp) -> size_t {
                 std::string* s = (std::string*)userp;
                 s->append((char*)buffer, size * nmemb);
                 return size * nmemb;
-            });
-            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_body);
-        
-            res = curl_easy_perform(curl);
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-            curl_slist_free_all(headers);
-            headers = NULL;
-
-            if (res == CURLE_OK) break;
-
-            if (res == CURLE_OPERATION_TIMEDOUT) {
-                 kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat WebDAV Timeout/LowSpeed. Retry %d/%d. Detail: %s", retries+1, m_net_max_retries, errbuf);
-            } else {
-                 kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat WebDAV Error %d. Retry %d/%d. Detail: %s", res, retries+1, m_net_max_retries, errbuf);
-                 { std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url); }
-            }
-            retries++;
-            if (retries < m_net_max_retries) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+             });
+             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_body);
         }
+        else
+        {
+             // HTTP HEAD Setup
+             SetupStatHeadOptions(curl, target_url);
+        }
+        
+        res = curl_easy_perform(curl);
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+        
+        // Clean headers
+        if (headers) { curl_slist_free_all(headers); headers = NULL; }
 
+        if (res == CURLE_OK) break;
+
+        // Fatal Error Check
+        if (IsFatalError(res))
+        {
+             kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat WebDAV/HTTP Fatal Error %d. Aborting. Detail: %s", res, errbuf);
+             if (res != CURLE_GOT_NOTHING) {
+                 std::lock_guard<std::mutex> l(g_redirect_cache_mutex); 
+                 g_redirect_cache.erase(m_file_url); 
+             }
+             break;
+        }
+        
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat Error %d. Retry %d/%d. Detail: %s", res, retries+1, m_net_max_retries, errbuf);
+        
+        std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url);
+        
+        retries++;
+        if (retries < m_net_max_retries) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    if (isWebDav)
+    {
         // --- Debug Log 插入 ---
         if (res != CURLE_OK || (response_code != 200 && response_code != 207))
         {
@@ -629,49 +666,10 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     else
     {
         // -------------------------------------------------------------
-        // HTTP/HTTPS 通用路径: 使用 HEAD 请求
+        // HTTP/HTTPS 通用路径: 解析 HEAD 请求结果
         // -------------------------------------------------------------
-        int retries = 0;
-        char errbuf[CURL_ERROR_SIZE];
-
-        while (retries < m_net_max_retries)
-        {
-            curl_easy_reset(curl);
-            errbuf[0] = 0;
-            
-            // 设置错误信息缓冲区
-            curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-            
-            SetupStatHeadOptions(curl, target_url);
-
-            res = curl_easy_perform(curl);
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-
-            if (res == CURLE_OK) break;
-
-            if (res == CURLE_OPERATION_TIMEDOUT) {
-                 kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat HEAD Timeout/LowSpeed. Retry %d/%d. Detail: %s", retries+1, m_net_max_retries, errbuf);
-            } else {
-                 // [Fix] Do not retry on connection refusal (Error 7)
-                 if (res == CURLE_COULDNT_CONNECT) {
-                     kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat HEAD Failed to connect (Error 7). Aborting. Detail: %s", errbuf);
-                     { std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url); }
-                     break;
-                 }
-                 // [New] Do not retry on Empty Reply (Error 52)
-                 else if (res == CURLE_GOT_NOTHING) {
-                     kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat HEAD Error 52 (Empty Reply). Aborting retry to Fallback GET. Detail: %s", errbuf);
-                     break;
-                 }
-
-                 kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat HEAD Error %d. Retry %d/%d. Detail: %s", res, retries+1, m_net_max_retries, errbuf);
-                 { std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url); }
-            }
-            retries++;
-            if (retries < m_net_max_retries) std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        }
-
-        // 使用 libcurl header API 解析
+        // 注意：请求已在上方统一循环中执行，这里仅处理 Response Header
+        
         struct curl_header *h = NULL;
         int64_t content_length = -1;
         curl_off_t cl = -1;
@@ -745,9 +743,9 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         // 对 .bdmv, .IFO, .BDM 等蓝光结构及图片文件，不做 fallback
         // 这些通常确实是小文件 且大多是kodi在频繁的扫文件夹，如果使用get，会穿透webdav缓存，直接访问源服务器，导致账号被风控
         // FIXME 对于404的fallback是兼容emby-next-gen的无奈之举，需更加严谨的调查改进
-        std::string ext = GetFileExtensionFromUrl(m_file_url); 
-        bool is_sensitive_file = (ext == "bdmv" || ext == "ifo" || ext == "bdm" || 
-                                ext == "jpg" || ext == "png" || ext == "tbn");
+        std::string check_ext = GetFileExtensionFromUrl(m_file_url); 
+        bool is_sensitive_file = (check_ext == "bdmv" || check_ext == "ifo" || check_ext == "bdm" || 
+                                check_ext == "jpg" || check_ext == "png" || check_ext == "tbn");
 
         if (res == CURLE_OK)
         {
@@ -1697,7 +1695,7 @@ void CCurlBuffer::SetupWorkerDownloadOptions(CURL* curl, const std::string& targ
     
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CCurlBuffer::WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, this);
-    curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 512 * 1024);
+    curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 1 * 1024 * 1024);
     curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)start);
 }
 
