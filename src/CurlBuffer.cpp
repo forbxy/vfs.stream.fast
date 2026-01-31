@@ -967,6 +967,16 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
     
     // 默认启用，后面根据条件禁用
     m_disable_static_caches = false;
+    
+    // [Small File Optimization] 2MB 以下文件: 强制开启全量缓存，不启动 Worker
+    bool is_small_file = (m_total_size > 0 && m_total_size <= 2 * 1024 * 1024);
+    if (is_small_file)
+    {
+        m_cfg_head_size = (size_t)m_total_size;
+        m_cfg_tail_size = 0; // 头部已覆盖全文，无需尾部
+        // 注意：不禁用 static caches，反而是依靠 static caches 来做 Full Cache
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [优化] 小文件 (%lld <= 2MB) -> 启用全量缓存模式.", m_total_size);
+    }
 
     // 1. 如果文件长度未知 (<=0) -> 禁用静态缓存，仅流式
     if (m_total_size <= 0) {
@@ -975,7 +985,8 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
     }
     // 2. 如果开启了 [仅ISO缓存] 且当前文件不是ISO -> 禁用静态缓存
     // 这涵盖了所有 mp4/mkv/ts 等容器，以及任何只要不是 ISO 的文件
-    else if (m_cfg_cache_iso_only && !m_is_iso) {
+    // [Fix] 如果是小文件优化模式，忽略 ISO 限制
+    else if (m_cfg_cache_iso_only && !m_is_iso && !is_small_file) {
          m_disable_static_caches = true;
          // 获取扩展名仅用于日志
          std::string ext = GetFileExtensionFromUrl(m_file_url);
@@ -984,7 +995,8 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
 
 
     // 3. (Fallback) 如果缓存尚未禁用，但文件太小 (< Preload Thresh) -> 禁用静态缓存 (不值得预热)
-    if (!m_disable_static_caches && m_total_size < m_cfg_preload_thresh) {
+    // [Fix] 小文件优化模式例外
+    if (!m_disable_static_caches && m_total_size < m_cfg_preload_thresh && !is_small_file) {
         m_disable_static_caches = true;
         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件小于阈值 (%lld < %lld), 禁用静态缓存模式, 仅使用流式.", m_total_size, m_cfg_preload_thresh);
     }
@@ -992,25 +1004,28 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
     // -------------------------------------------------------------
     // 动态内存策略 (Dynamic Memory Policy)
     // -------------------------------------------------------------
-    // -------------------------------------------------------------
-    // 动态内存策略 (Dynamic Memory Policy)
-    // -------------------------------------------------------------
     
-    // 1. 如果文件长度未知 (0)，使用保守的 Buffer 大小 (5MB)，避免浪费过多内存，同时保持流式能力
-    if (m_total_size <= 0)
+    // 1. 小文件全量缓存模式：不需要 RingBuffer
+    if (is_small_file)
+    {
+        m_ring_buffer_size = 0;
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 小文件优化 -> 禁用循环缓冲区 (RingBuffer Disabled)，仅使用内存全量缓存.");
+    }
+    // 2. 如果文件长度未知 (0)，使用保守的 Buffer 大小 (5MB)，避免浪费过多内存，同时保持流式能力
+    else if (m_total_size <= 0)
     {
         m_ring_buffer_size = 5 * 1024 * 1024; // 5MB Conservative Buffer
         // [Dynamic] 当长度为0时，直接将历史数据保留设置为0，防止死锁
         m_cfg_history_size = 0;
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 未知长度 (0) -> RingBuffer: %zu bytes (Conservative), History: 0 (Disabled)", m_ring_buffer_size);
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 未知长度 (0) -> 循环缓冲区: %zu bytes (保守模式), 历史回溯: 0 (已禁用)", m_ring_buffer_size);
     }
-    // 2. RingBuffer 大小: 若为小文件 (< 配置的 RingBuffer 大小)，Buffer 仅分配文件大小
+    // 3. RingBuffer 大小: 若为常规小文件 (< 配置的 RingBuffer 大小)，Buffer 仅分配文件大小
     else if (m_total_size < (int64_t)m_cfg_ring_size)
     {
         // 向上对齐到 64KB
         size_t aligned_size = (size_t)((m_total_size + 65535) / 65536) * 65536;
         m_ring_buffer_size = aligned_size;
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [小文件优化] %lld bytes < RingSize(%zu) -> RingBuffer: %zu bytes", m_total_size, m_cfg_ring_size, m_ring_buffer_size);
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [小文件优化] %lld bytes < RingSize(%zu) -> 循环缓冲区: %zu bytes", m_total_size, m_cfg_ring_size, m_ring_buffer_size);
     }
     else
     {
@@ -1804,6 +1819,13 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
     std::unique_lock<std::mutex> lock(m_ring_buffer_mutex);
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read() 请求 %zu bytes (Pos: %lld)", size, m_logical_position);
 
+    // [EOF Check] 
+    if (m_total_size > 0 && m_logical_position >= m_total_size)
+    {
+         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read() EOF Reached (Pos >= Total). Returning 0.");
+         return 0;
+    }
+
     size_t total_read = 0;
 
     // ---------------------------------------------------------
@@ -1830,11 +1852,6 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
             {
                 memcpy(buffer, m_head_buffer->data() + m_logical_position, effective_request);
 
-                // [防御性编程] 处理 Short Read 的清零
-                if (effective_request < size)
-                {
-                    memset(buffer + effective_request, 0, size - effective_request);
-                }
 
                 kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 完全命中头部缓存. Pos: %lld, Req: %zu, Actual: %zu", m_logical_position, size, effective_request);
                 m_logical_position += effective_request;
