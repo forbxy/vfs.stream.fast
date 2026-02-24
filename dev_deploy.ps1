@@ -1,38 +1,49 @@
 # Config Paths
-$KodiAddonsPath = "$env:LOCALAPPDATA\Packages\XBMCFoundation.Kodi_4n2hpmxwrvr6p\LocalCache\Roaming\Kodi\addons"
+$KodiAddonsPath_UWP = "$env:LOCALAPPDATA\Packages\XBMCFoundation.Kodi_4n2hpmxwrvr6p\LocalCache\Roaming\Kodi\addons"
+$KodiAddonsPath_Exe = "$env:APPDATA\Kodi\addons"
+
+if (Test-Path $KodiAddonsPath_Exe) {
+    $KodiAddonsPath = $KodiAddonsPath_Exe
+    Write-Host "Detected standard Kodi installation at: $KodiAddonsPath"
+} elseif (Test-Path $KodiAddonsPath_UWP) {
+    $KodiAddonsPath = $KodiAddonsPath_UWP
+    Write-Host "Detected UWP Kodi installation at: $KodiAddonsPath"
+} else {
+    Write-Error "Kodi addons folder not found. Checked:`n  $KodiAddonsPath_Exe`n  $KodiAddonsPath_UWP"
+    exit 1
+}
+
 $AddonId = "vfs.stream.fast"
 $TargetDir = Join-Path $KodiAddonsPath $AddonId
 $ReleaseDll = "build\Release\vfs.stream.fast.dll"
 $DebugDll = "build\Debug\vfs.stream.fast.dll"
-$SourceDll = $null
+$RootBuildDll = "build\vfs.stream.fast.dll"
 
-if ((Test-Path $ReleaseDll) -and (Test-Path $DebugDll)) {
-    # Both exist, pick the newer one
-    $RelTime = (Get-Item $ReleaseDll).LastWriteTime
-    $DebTime = (Get-Item $DebugDll).LastWriteTime
-    if ($RelTime -gt $DebTime) {
-        $SourceDll = $ReleaseDll
-        Write-Host "Selected Release build (Newer)"
-    } else {
-        $SourceDll = $DebugDll
-        Write-Host "Selected Debug build (Newer)"
+# Check all possible build locations and pick the newest one
+$Candidates = @($ReleaseDll, $DebugDll, $RootBuildDll)
+$SourceDll = $null
+$NewestTime = [DateTime]::MinValue
+
+foreach ($Candidate in $Candidates) {
+    if (Test-Path $Candidate) {
+        $Time = (Get-Item $Candidate).LastWriteTime
+        if ($Time -gt $NewestTime) {
+            $NewestTime = $Time
+            $SourceDll = $Candidate
+        }
     }
-} elseif (Test-Path $ReleaseDll) {
-    $SourceDll = $ReleaseDll
-} elseif (Test-Path $DebugDll) {
-    $SourceDll = $DebugDll
+}
+
+if ($SourceDll) {
+    Write-Host "Selected build: $SourceDll (Time: $NewestTime)"
 } else {
-    # Neither exists, default to Release for error message purposes, or handle later
+    # Default fallback for error message
     $SourceDll = $ReleaseDll
 }
 $SourceXml = "addon.xml"
 $SourceResources = "resources"
 
-# Check Kodi Path
-if (-not (Test-Path $KodiAddonsPath)) {
-    Write-Error "Kodi addons folder not found: $KodiAddonsPath. Please check if Kodi (Store Version) is installed."
-    exit 1
-}
+# Check Kodi Path is handled at the beginning
 
 # Check Source Files
 if (-not (Test-Path $SourceDll)) {

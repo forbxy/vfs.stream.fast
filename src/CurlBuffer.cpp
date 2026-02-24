@@ -969,13 +969,16 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
     m_disable_static_caches = false;
     
     // [Small File Optimization] 2MB 以下文件: 强制开启全量缓存，不启动 Worker
-    bool is_small_file = (m_total_size > 0 && m_total_size <= 2 * 1024 * 1024);
+    // 修改为: 如果文件体积 <= 头部缓存配置的 90% (e.g. 30MB -> 27MB), 视为小文件
+    int64_t small_file_thresh = (int64_t)(m_cfg_head_size * 0.9);
+    bool is_small_file = (m_total_size > 0 && m_total_size <= small_file_thresh);
+
     if (is_small_file)
     {
         m_cfg_head_size = (size_t)m_total_size;
         m_cfg_tail_size = 0; // 头部已覆盖全文，无需尾部
         // 注意：不禁用 static caches，反而是依靠 static caches 来做 Full Cache
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [优化] 小文件 (%lld <= 2MB) -> 启用全量缓存模式.", m_total_size);
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [优化] 小文件 (%lld <= %lld) -> 启用全量缓存模式.", m_total_size, small_file_thresh);
     }
 
     // 1. 如果文件长度未知 (<=0) -> 禁用静态缓存，仅流式
