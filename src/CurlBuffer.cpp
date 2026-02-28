@@ -781,7 +781,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                 //对于一些302跳转的服务器，head请求不执行跳转，我们必须使用GET请求来触发跳转获取正确的文件大小
                 else if (response_code == 200 && content_length <= 0)
                 {
-                    need_fallback = false;
+                    need_fallback = true;
                 }
              }
         }
