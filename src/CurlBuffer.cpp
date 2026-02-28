@@ -1007,6 +1007,8 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
     // -------------------------------------------------------------
     // 动态内存策略 (Dynamic Memory Policy)
     // -------------------------------------------------------------
+    // 初始化状态标记
+    m_is_small_file_mode = is_small_file;
     
     // 1. 小文件全量缓存模式：不需要 RingBuffer
     if (is_small_file)
@@ -1851,16 +1853,32 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
             }
 
             // 只有当缓存包含所有"有效"请求数据时才命中
-            if (effective_request <= available_in_cache)
+            // [Fix] 如果是小文件模式，且缓存数据小于预期(Short Read)，但我们已经尽力全量下载了
+            // 那么也应该尽力交付已有的缓存数据，随后依靠 EOF 机制。
+            if (effective_request <= available_in_cache || (m_is_small_file_mode && available_in_cache > 0))
             {
-                memcpy(buffer, m_head_buffer->data() + m_logical_position, effective_request);
+                size_t actual_copy = std::min(effective_request, available_in_cache);
+                memcpy(buffer, m_head_buffer->data() + m_logical_position, actual_copy);
 
 
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 完全命中头部缓存. Pos: %lld, Req: %zu, Actual: %zu", m_logical_position, size, effective_request);
-                m_logical_position += effective_request;
-                return effective_request;
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 完全命中头部缓存. Pos: %lld, Req: %zu, Actual: %zu", m_logical_position, size, actual_copy);
+                m_logical_position += actual_copy;
+                return actual_copy;
             }
         }
+
+        // [New] 小文件全量缓存模式专用保护
+        // 如果处于小文件模式，且未命中头部缓存 (Penetrated)，
+        // 这意味着要么是 seek 到了未下载的区域 (不应该发生，因为小文件应全量下载)，
+        // 要么是之前 Stat 错误导致在这里认为还有数据但实际已经是 EOF (或者 Short Read 导致的空洞，但我们不再尝试补全)
+        // 直接返回 -1 以防止死锁或错误的 JIT 调用
+        if (m_is_small_file_mode)
+        {
+             kodi::Log(ADDON_LOG_WARNING, "FastVFS: 小文件全量缓存穿透 (Missed Head). Pos: %lld, HeadValid: %zu. 返回 EOF (0).", 
+                 m_logical_position, m_head_valid_length);
+             return 0;
+        }
+
         // B. 尾部缓存 (Tail Cache)
         else if (m_total_size > 0 && m_tail_valid_from != -1 && m_logical_position >= m_tail_valid_from)
         {

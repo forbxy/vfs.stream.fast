@@ -150,6 +150,9 @@ private:
     // 4. 中间热点缓存 (JIT Cache - 20MB)
     std::shared_ptr<std::vector<uint8_t>> m_middle_buffer;
     int64_t m_middle_valid_from = -1; // -1 无效
+    // [New] 标记是否为小文件全量缓存模式
+    bool m_is_small_file_mode = false; 
+
     bool CreateMiddleCache(int64_t start_pos);
     std::mutex m_ring_buffer_mutex;
     std::condition_variable m_cv_reader; // 读者等数据
