@@ -9,29 +9,78 @@
 #include <thread>
 #include <atomic>
 #include <map>
+#include <list>
+#include <unordered_map>
 #include <sstream>
 
 // -----------------------------------------------------------------------------------------
-// 全局数据缓存 (Head & Tail)
+// 全局 LRU 块缓存 (Global LRU Block Cache)
 // -----------------------------------------------------------------------------------------
-// 单文件缓存策略：仅保留最后访问的文件缓存
-struct GlobalDataCacheEntry
+// 替代原有的 Head/Tail/Middle 静态缓存，使用统一的 LRU 块缓存
+// 块大小 = 1MB (与 GetChunkSize 一致)，总容量 100MB = 100 块
+// 全局有效，切换文件时自动清空
+struct LRUBlockCache
 {
     std::string url;
-    std::shared_ptr<std::vector<uint8_t>> head_buffer;
-    std::shared_ptr<std::vector<uint8_t>> tail_buffer;
-    size_t head_valid_length = 0;
-    int64_t tail_valid_from = -1;
-
-    // 热点缓存 (Middle/JIT Cache)
-    std::shared_ptr<std::vector<uint8_t>> middle_buffer;
-    int64_t middle_valid_from = -1;
-
     int64_t total_size = 0;
+
+    // LRU 链表: front = 最近使用, back = 最久未用
+    std::list<int64_t> lru_order;
+
+    // block_num -> { 在 lru_order 中的迭代器, 块数据 }
+    std::unordered_map<int64_t, std::pair<std::list<int64_t>::iterator, std::vector<uint8_t>>> blocks;
+
+    // 查询块，命中则提升到 MRU 端
+    bool Get(int64_t block_num, const uint8_t*& data, size_t& valid_size)
+    {
+        auto it = blocks.find(block_num);
+        if (it == blocks.end()) return false;
+        lru_order.splice(lru_order.begin(), lru_order, it->second.first);
+        data = it->second.second.data();
+        valid_size = it->second.second.size();
+        return true;
+    }
+
+    // 插入块 (自动驱逐最久未用的块)
+    void Put(int64_t block_num, const uint8_t* data, size_t size)
+    {
+        auto it = blocks.find(block_num);
+        if (it != blocks.end())
+        {
+            it->second.second.assign(data, data + size);
+            lru_order.splice(lru_order.begin(), lru_order, it->second.first);
+            return;
+        }
+        while (blocks.size() >= CCurlBuffer::LRU_MAX_BLOCKS && !lru_order.empty())
+        {
+            int64_t victim = lru_order.back();
+            lru_order.pop_back();
+            blocks.erase(victim);
+        }
+        lru_order.push_front(block_num);
+        blocks[block_num] = { lru_order.begin(), std::vector<uint8_t>(data, data + size) };
+    }
+
+    void Clear()
+    {
+        lru_order.clear();
+        blocks.clear();
+    }
+
+    // 切换文件时重置
+    void Reset(const std::string& new_url, int64_t new_total_size)
+    {
+        if (url != new_url)
+        {
+            Clear();
+            url = new_url;
+        }
+        total_size = new_total_size;
+    }
 };
 
-static GlobalDataCacheEntry g_data_cache;
-static std::mutex g_data_cache_mutex;
+static LRUBlockCache g_lru_cache;
+static std::mutex g_lru_cache_mutex;
 
 // -----------------------------------------------------------------------------------------
 // 全局 Stat 缓存 (Metadata Cache)
@@ -962,69 +1011,25 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
     }
 
     // -------------------------------------------------------------
-    // [Fix] 静态缓存控制 (Static Cache Controller)
+    // LRU 缓存重置 (文件切换时清空)
     // -------------------------------------------------------------
-    
-    // 默认启用，后面根据条件禁用
-    m_disable_static_caches = false;
-    
-    // [Small File Optimization] 2MB 以下文件: 强制开启全量缓存，不启动 Worker
-    // 修改为: 如果文件体积 <= 头部缓存配置的 90% (e.g. 30MB -> 27MB), 视为小文件
-    int64_t small_file_thresh = (int64_t)(m_cfg_head_size * 0.9);
-    bool is_small_file = (m_total_size > 0 && m_total_size <= small_file_thresh);
-
-    if (is_small_file)
     {
-        m_cfg_head_size = (size_t)m_total_size;
-        m_cfg_tail_size = 0; // 头部已覆盖全文，无需尾部
-        // 注意：不禁用 static caches，反而是依靠 static caches 来做 Full Cache
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [优化] 小文件 (%lld <= %lld) -> 启用全量缓存模式.", m_total_size, small_file_thresh);
-    }
-
-    // 1. 如果文件长度未知 (<=0) -> 禁用静态缓存，仅流式
-    if (m_total_size <= 0) {
-        m_disable_static_caches = true;
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件长度未知 (0), 禁用静态缓存模式, 仅使用流式.");
-    }
-    // 2. 如果开启了 [仅ISO缓存] 且当前文件不是ISO -> 禁用静态缓存
-    // 这涵盖了所有 mp4/mkv/ts 等容器，以及任何只要不是 ISO 的文件
-    // [Fix] 如果是小文件优化模式，忽略 ISO 限制
-    else if (m_cfg_cache_iso_only && !m_is_iso && !is_small_file) {
-         m_disable_static_caches = true;
-         // 获取扩展名仅用于日志
-         std::string ext = GetFileExtensionFromUrl(m_file_url);
-         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Config] 仅ISO开启缓存，非ISO文件 (Ext: %s) -> 禁用静态缓存.", ext.c_str());
-    }
-
-
-    // 3. (Fallback) 如果缓存尚未禁用，但文件太小 (< Preload Thresh) -> 禁用静态缓存 (不值得预热)
-    // [Fix] 小文件优化模式例外
-    if (!m_disable_static_caches && m_total_size < m_cfg_preload_thresh && !is_small_file) {
-        m_disable_static_caches = true;
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件小于阈值 (%lld < %lld), 禁用静态缓存模式, 仅使用流式.", m_total_size, m_cfg_preload_thresh);
+        std::lock_guard<std::mutex> lock(g_lru_cache_mutex);
+        g_lru_cache.Reset(m_file_url, m_total_size);
     }
 
     // -------------------------------------------------------------
     // 动态内存策略 (Dynamic Memory Policy)
     // -------------------------------------------------------------
-    // 初始化状态标记
-    m_is_small_file_mode = is_small_file;
     
-    // 1. 小文件全量缓存模式：不需要 RingBuffer
-    if (is_small_file)
-    {
-        m_ring_buffer_size = 0;
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 小文件优化 -> 禁用循环缓冲区 (RingBuffer Disabled)，仅使用内存全量缓存.");
-    }
-    // 2. 如果文件长度未知 (0)，使用保守的 Buffer 大小 (5MB)，避免浪费过多内存，同时保持流式能力
-    else if (m_total_size <= 0)
+    // 1. 如果文件长度未知 (0)，使用保守的 Buffer 大小 (5MB)
+    if (m_total_size <= 0)
     {
         m_ring_buffer_size = 5 * 1024 * 1024; // 5MB Conservative Buffer
-        // [Dynamic] 当长度为0时，直接将历史数据保留设置为0，防止死锁
         m_cfg_history_size = 0;
         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 未知长度 (0) -> 循环缓冲区: %zu bytes (保守模式), 历史回溯: 0 (已禁用)", m_ring_buffer_size);
     }
-    // 3. RingBuffer 大小: 若为常规小文件 (< 配置的 RingBuffer 大小)，Buffer 仅分配文件大小
+    // 2. RingBuffer 大小: 若文件小于配置的 RingBuffer 大小，Buffer 仅分配文件大小
     else if (m_total_size < (int64_t)m_cfg_ring_size)
     {
         // 向上对齐到 64KB
@@ -1042,9 +1047,6 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
 
     // 初始化基础状态
     m_logical_position = 0;
-    m_head_valid_length = 0;
-    m_tail_valid_from = -1;
-    m_middle_valid_from = -1; // Reset Middle Cache state
     // 重置运行状态确保安全
     m_is_running = false; 
 
@@ -1109,142 +1111,7 @@ size_t CCurlBuffer::CacheWriteCallback(void *contents, size_t size, size_t nmemb
     return realsize;
 }
 
-bool CCurlBuffer::PreloadCaches()
-{
-    // [Fix] 逻辑已移至 Open，从 PreloadCaches 移除
-    if (m_disable_static_caches)
-    {
-         // 已在 Open 中记录日志
-         return true;
-    }
 
-    // 0. 本地缓存检查 (Local Check) - 避免重复进入 global lock
-    bool need_head = (m_head_valid_length == 0);
-    bool need_tail = (m_total_size > (int64_t)(100 * 1024 * 1024)) && (m_tail_valid_from == -1);
-
-    if (!need_head && !need_tail)
-        return true;
-
-    // Check Global Cache
-    {
-        std::lock_guard<std::mutex> lock(g_data_cache_mutex);
-        if (g_data_cache.url == m_file_url && g_data_cache.total_size == m_total_size)
-        {
-            if (need_head && g_data_cache.head_valid_length > 0)
-            {
-                m_head_buffer = g_data_cache.head_buffer; // Zero-copy pointer assignment
-                m_head_valid_length = g_data_cache.head_valid_length;
-                need_head = false;
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 全局缓存命中: 头部.");
-            }
-            
-            if (need_tail && g_data_cache.tail_valid_from != -1)
-            {
-                m_tail_buffer = g_data_cache.tail_buffer; // Zero-copy pointer assignment
-                m_tail_valid_from = g_data_cache.tail_valid_from;
-                need_tail = false;
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 全局缓存命中: 尾部.");
-            }
-        }
-        else
-        {
-             // URL 不匹配，意味着切换了文件，清空旧缓存以释放内存
-             g_data_cache = GlobalDataCacheEntry();
-             g_data_cache.url = m_file_url;
-        }
-    }
-
-    if (!need_head && !need_tail)
-        return true;
-
-    CURL* curl = GetCurlHandleFromPool();
-    if (!curl) return false;
-
-    // -------------------
-    // 1. 下载头部 (Head)
-    // -------------------
-    if (need_head)
-    {
-        // 懒加载内存分配
-        m_head_buffer = std::make_shared<std::vector<uint8_t>>();
-        m_head_buffer->resize(m_cfg_head_size);
-
-        // 确保清除上一次的状态
-        curl_easy_reset(curl);
-
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 开始下载头部... (0 - %zu)", m_head_buffer->size());
-        if (DownloadRange(curl, 0, m_head_buffer->size(), *m_head_buffer))
-        {
-            m_head_valid_length = m_head_buffer->size();
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 头部下载完成.");
-        }
-        else
-        {
-            kodi::Log(ADDON_LOG_ERROR, "FastVFS: [预热] 头部下载失败.");
-            ReturnCurlHandleToPool(curl);
-            return false;
-        }
-    }
-
-    // -------------------
-    // 2. 下载尾部 (Tail)
-    // -------------------
-    bool ret = true;
-    if (need_tail)
-    {
-        // 懒加载内存分配
-        m_tail_buffer = std::make_shared<std::vector<uint8_t>>();
-        m_tail_buffer->resize(m_cfg_tail_size);
-        
-        int64_t tail_start = m_total_size - m_tail_buffer->size();
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 开始下载尾部... Start: %lld", tail_start);
-        
-        if (DownloadRange(curl, tail_start, m_tail_buffer->size(), *m_tail_buffer))
-        {
-            m_tail_valid_from = tail_start;
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 尾部下载完成. 覆盖范围: %lld - %lld (Total: %lld)", 
-                tail_start, tail_start + (int64_t)m_tail_buffer->size(), m_total_size);
-
-        }
-        else
-        {
-            kodi::Log(ADDON_LOG_ERROR, "FastVFS: [预热] 尾部下载失败.");
-            ret = false;
-        }
-    }
-    
-    ReturnCurlHandleToPool(curl);
-
-    // -------------------
-    // 3. 更新全局缓存
-    // -------------------
-    if (ret)
-    {
-        std::lock_guard<std::mutex> lock(g_data_cache_mutex);
-        // 如果缓存 Key 还是我们开始时的 URL (即没人动过)，或者即使是最终跳转后的 URL (如果有人已经更新了)
-        // 我们都应该更新内容。关键是我们要把最终有效的 m_file_url 存进去。
-        if (g_data_cache.url == m_file_url)
-        {
-            g_data_cache.url = m_file_url; // 确保 Key 是最新的有效 URL (Redirected)
-            g_data_cache.total_size = m_total_size;
-            
-            if (m_head_valid_length > 0)
-            {
-                g_data_cache.head_buffer = m_head_buffer;
-                g_data_cache.head_valid_length = m_head_valid_length;
-            }
-            
-            if (m_tail_valid_from != -1)
-            {
-                g_data_cache.tail_buffer = m_tail_buffer;
-                g_data_cache.tail_valid_from = m_tail_valid_from;
-            }
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 更新全局缓存成功. URL: %s", m_file_url.c_str());
-        }
-    }
-
-    return ret;
-}
 
 // -----------------------------------------------------------------------------------------
 // Helper: Extract Host from URL (used to detect cross-domain redirects)
@@ -1732,24 +1599,6 @@ size_t CCurlBuffer::HandleWrite(void *contents, size_t size)
 
     std::unique_lock<std::mutex> lock(m_ring_buffer_mutex);
 
-    // [New] 更新累计下载并检查阈值
-    // 阈值规则: max(头部+尾部+JIT, 500MB)
-    // 注意：只要 m_disable_static_caches 变成 true，就不再变回去
-    if (!m_disable_static_caches)
-    {
-        m_accumulated_download_bytes += size;
-        
-        // 计算阈值 (动态计算避免初始化顺序问题，且开销极小)
-        int64_t threshold = std::max((size_t)(500 * 1024 * 1024), m_cfg_head_size + m_cfg_tail_size + m_cfg_middle_size);
-        
-        if (m_accumulated_download_bytes > threshold)
-        {
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 累计下载超过阈值 (%lld > %lld). 屏蔽静态缓存.", 
-                (int64_t)m_accumulated_download_bytes, threshold);
-            m_disable_static_caches = true;
-        }
-    }
-
     // ---------------------------------------------------------
     // 常规写入环形缓冲区 (Ring Buffer Write Only)
     // ---------------------------------------------------------
@@ -1803,28 +1652,9 @@ size_t CCurlBuffer::HandleWrite(void *contents, size_t size)
 
 ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
 {
-    // ---------------------------------------------------------
-    // 0. 延迟预热检查 (Lazy Preload Check)
-    // ---------------------------------------------------------
-    // 每次 Read 前确保头尾缓存就绪 (如果是大文件且未初始化)
-    // PreloadCaches 内部有状态检查，初始化过的会直接返回 true，开销极小
-    // 注意: 这里不加锁 buffer_mutex，因为 PreloadCaches 是独立的连接操作，且只在初始化时写入
-    // 另外，如果下载失败，返回 -1 通知 Kodi 错误
-    
-    // [Fix] 仅当没有禁用静态缓存时才执行预热检查
-    if (!m_disable_static_caches)
-    {
-        if (!PreloadCaches())
-        {
-            kodi::Log(ADDON_LOG_ERROR, "FastVFS: Read 失败 - 预热缓存下载失败");
-            return -1; // 返回 -1 表示读错误
-        }
-    }
-
-    std::unique_lock<std::mutex> lock(m_ring_buffer_mutex);
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read() 请求 %zu bytes (Pos: %lld)", size, m_logical_position);
 
-    // [EOF Check] 
+    // [EOF Check]
     if (m_total_size > 0 && m_logical_position >= m_total_size)
     {
          kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read() EOF Reached (Pos >= Total). Returning 0.");
@@ -1833,348 +1663,213 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
 
     size_t total_read = 0;
 
-    // ---------------------------------------------------------
-    // 1. 优先检查静态缓存 (Static Caches) - 全命中策略
-    // ---------------------------------------------------------
-    // [New] 超过一定下载量后屏蔽静态缓存，防止大数偏移错误或干扰顺序播放
-    if (!m_disable_static_caches)
-    {
-        // A. 头部缓存 (Head Cache)
-        if (m_logical_position < (int64_t)m_head_valid_length)
-        {
-            // 计算实际需要提供的数据量 (处理 EOF 情况)
-            size_t available_in_cache = (size_t)(m_head_valid_length - m_logical_position);
-            size_t effective_request = size;
-            
-            // 如果文件很小，请求超出了总大小，我们将请求截断到 EOF，这样也算是"完全命中"
-            if (m_total_size > 0 && m_logical_position + (int64_t)size > m_total_size)
-            {
-                effective_request = (size_t)(m_total_size - m_logical_position);
-            }
-
-            // 只有当缓存包含所有"有效"请求数据时才命中
-            // [Fix] 如果是小文件模式，且缓存数据小于预期(Short Read)，但我们已经尽力全量下载了
-            // 那么也应该尽力交付已有的缓存数据，随后依靠 EOF 机制。
-            if (effective_request <= available_in_cache || (m_is_small_file_mode && available_in_cache > 0))
-            {
-                size_t actual_copy = std::min(effective_request, available_in_cache);
-                memcpy(buffer, m_head_buffer->data() + m_logical_position, actual_copy);
-
-
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 完全命中头部缓存. Pos: %lld, Req: %zu, Actual: %zu", m_logical_position, size, actual_copy);
-                m_logical_position += actual_copy;
-                return actual_copy;
-            }
-        }
-
-        // [New] 小文件全量缓存模式专用保护
-        // 如果处于小文件模式，且未命中头部缓存 (Penetrated)，
-        // 这意味着要么是 seek 到了未下载的区域 (不应该发生，因为小文件应全量下载)，
-        // 要么是之前 Stat 错误导致在这里认为还有数据但实际已经是 EOF (或者 Short Read 导致的空洞，但我们不再尝试补全)
-        // 直接返回 -1 以防止死锁或错误的 JIT 调用
-        if (m_is_small_file_mode)
-        {
-             kodi::Log(ADDON_LOG_WARNING, "FastVFS: 小文件全量缓存穿透 (Missed Head). Pos: %lld, HeadValid: %zu. 返回 EOF (0).", 
-                 m_logical_position, m_head_valid_length);
-             return 0;
-        }
-
-        // B. 尾部缓存 (Tail Cache)
-        else if (m_total_size > 0 && m_tail_valid_from != -1 && m_logical_position >= m_tail_valid_from)
-        {
-            // int64_t tail_start = m_total_size - m_tail_buffer->size(); 
-            // [Fix] 直接使用 m_tail_valid_from 作为基准，不再重新计算 tail_start
-            // 因为如果 DownloadRange 发生了 Short Read 导致 buffer resize，重新计算会导致偏移错误
-            {
-                // [Fix] 32-bit Overflow Fix
-                int64_t diff = m_logical_position - m_tail_valid_from;
-                
-                // 只要 offset 在缓存范围内，我们就拥有直到 EOF 的所有数据。
-                if (diff >= 0 && diff < (int64_t)m_tail_buffer->size())
-                {
-                    size_t offset = (size_t)diff;
-                    size_t bytes_left_in_cache = m_tail_buffer->size() - offset;
-                    size_t to_copy = std::min(size, bytes_left_in_cache);
-
-                    memcpy(buffer, m_tail_buffer->data() + offset, to_copy);
-
-                    // [防御性编程] 如果读不满(到了EOF)，将剩余buffer清零，给个"干净的标记"
-                    if (to_copy < size)
-                    {
-                        memset(buffer + to_copy, 0, size - to_copy);
-                    }
-
-                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 完全命中尾部缓存. Pos: %lld, Req: %zu, Actual: %zu%s", 
-                        m_logical_position, size, to_copy, (to_copy < size ? " (EOF)" : ""));
-                    
-                    m_logical_position += to_copy;
-                    return to_copy;
-                }
-            }
-        }
-
-        // ---------------------------------------------------------
-        // C. 如果头尾缓存都未命中，但kodi还是解析ISO，这就是最后的解药。
-        // 中间热点缓存 (JIT Middle Cache) - 针对 ISO 菜单等随机读取优化
-        // ---------------------------------------------------------
-        
-        // 如果 Worker 未运行，且确实需要使用热点缓存（非顺序读取，或者强制使用）
-        // [Fix] 只有当文件大小已知 (>0) 时才允许使用 JIT 缓存。未知大小时无法计算 Range。
-        if (!m_worker_thread.joinable() && m_total_size > 0)
-        {
-            // 尝试获取或创建 JIT Cache
-            // CreateMiddleCache 内部会检查是否已存在有效的覆盖
-            // 注意：原本只针对 Random Seek，现在根据指示，对于 !Worker 的情况直接依赖 JIT
-            
-            // [Optimization] 将下载起始位置向前移动 10%，增加命中几率并覆盖可能的小幅回跳
-            int64_t back_offset = (int64_t)(m_cfg_middle_size / 10);
-            int64_t adjusted_start = (m_logical_position > back_offset) ? (m_logical_position - back_offset) : 0;
-            
-            if (!CreateMiddleCache(adjusted_start))
-            {
-                kodi::Log(ADDON_LOG_ERROR, "FastVFS: CreateMiddleCache 下载失败，Read 终止.");
-                return -1;
-            }
-        }
-
-        // 尝试从 JIT 缓存读取 (CreateMiddleCache 成功后，这里一定会命中，除非 Cache 大小设计问题)
-        if (m_middle_valid_from != -1 && m_logical_position >= m_middle_valid_from)
-        {
-            // [Fix] 32-bit Overflow Fix
-            int64_t diff = m_logical_position - m_middle_valid_from;
-            
-            if (diff >= 0 && diff < (int64_t)m_middle_buffer->size())
-            {
-                size_t offset = (size_t)diff;
-                size_t bytes_left_in_cache = m_middle_buffer->size() - offset;
-                size_t to_copy = std::min(size, bytes_left_in_cache);
-
-                memcpy(buffer, m_middle_buffer->data() + offset, to_copy);
-                
-                // [防御性编程]
-                if (to_copy < size)
-                    memset(buffer + to_copy, 0, size - to_copy);
-
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 命中JIT热点缓存. Pos: %lld, Req: %zu, Actual: %zu", m_logical_position, size, to_copy);
-                m_logical_position += to_copy;
-
-                // [JIT 接力机制]
-                // 如果读取进度超过了热点缓存的一半，且 Worker 未启动，说明这可能是一个连续播放行为
-                // 提前启动 Worker，实现无缝衔接 (虽然可能重复下载一小段热点缓存中剩余的数据，但保证了逻辑简单连续)
-                // [优化] 只有当 JIT 缓存没有覆盖到文件末尾时才启动 Worker。如果 JIT 已经包含 EOF，直接用 JIT 读完即可。
-                // [Request] 针对 ISO 文件，禁用 JIT 接力机制 (避免频繁触发 Worker)
-                bool is_covered_to_eof = (m_total_size > 0 && (m_middle_valid_from + (int64_t)m_middle_buffer->size() >= m_total_size));
-
-                // [Optimized] 使用成员变量 m_is_iso，该变量会在 Stat/DownloadRange 的重定向中自动更新
-                if (!m_worker_thread.joinable() && !is_covered_to_eof && !m_is_iso && offset > m_middle_buffer->size() / 2)
-                {
-                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 检测到连续读取 (Offset: %zu > Half), 提前启动 Worker 接力.", offset);
-                    StartWorker();
-                }
-
-                return to_copy;
-            }
-        }
-    } // End of m_disable_static_caches check
-
-    // ---------------------------------------------------------
-    // 延迟初始化 (Lazy Init)
-    // ---------------------------------------------------------
-    // 只有当缓存未命中，且确实需要从 RingBuffer 读取时才启动
-    if (!m_worker_thread.joinable())
-    {
-        StartWorker();
-    }
-
-    // ---------------------------------------------------------
-    // 2. 状态检查与决策 (Decision Making)
-    // ---------------------------------------------------------
-    
-    // 检查 EOF (防止触发 Too Far 误报)
-    if (m_total_size > 0 && m_logical_position >= m_total_size)
-    {
-        return total_read;
-    }
-
-    int64_t buffer_valid_start = m_download_position - m_rb_bytes_available; // 环形队列中数据的起始逻辑位置
-    int64_t buffer_valid_end = m_download_position;                     // 环形队列中数据的结束逻辑位置
-    int64_t plan_limit = m_download_position + (int64_t)m_ring_buffer_size;    // 视为"计划中"的最大范围
-
-    bool need_reset = false;
-
-    // 情况 A: 落后 (Lag) - 数据已被覆盖
-    if (m_logical_position < buffer_valid_start)
-    {
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 落后 (Lag). Req: %lld, BufStart: %lld. 触发瞬移.", m_logical_position, buffer_valid_start);
-        need_reset = true;
-    }
-    // 情况 B: 超前 (Too Far) - 超出计划范围，或者虽然在计划内但差距过大
-    // 如果 Seek 到很远的位置，超过了这个范围，与其等待下载这一大段无用数据，不如直接重置
-    // [Fix] 增加 gap > 20MB 的判断。即使 Buffer 很大(100MB+)，如果 gap 很大，等待下载不如重新连接快。
-    else if (m_logical_position > plan_limit || (m_logical_position - buffer_valid_end) > (16 * 1024 * 1024))
-    {
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 超前 (Too Far/Gap > 16MB). Req: %lld, Limit: %lld, Gap: %lld. 触发瞬移.", 
-            m_logical_position, plan_limit, (int64_t)(m_logical_position - buffer_valid_end));
-        need_reset = true;
-    }
-
-    if (need_reset)
-    {
-        // 1. 设置目标
-        m_reset_target_pos = m_logical_position;
-        // 2. 举旗
-        m_trigger_reset = true;
-        m_abort_transfer = true; // 打断 Worker!
-        // 3. 唤醒可能的睡眠 Worker
-        m_cv_writer.notify_all(); 
-        
-        // 4. 清除错误标志，让 Read 循环继续并进入 wait
-        m_has_error = false;
-        m_is_eof = false; 
-        
-        // 注意：这里不需要 unlock/join。我们持有锁进入下方的 m_cv_reader.wait，释放锁后 Worker 会接管并重置。
-    }
-
-    // 只有在确定不触发重置的情况下，如果处于错误状态，才返回错误
-    // 这样允许通过 Seek (导致 Lag/TooFar -> Reset) 来从错误中恢复
-    if (m_has_error && !need_reset)
-        return -1;
-
-    // ---------------------------------------------------------
-    // 3. 对齐队列头 (Align Ring Buffer Tail/Read Ptr)
-    // ---------------------------------------------------------
-    // 如果逻辑位置在现有数据中间，或者在"计划"中（意味着我们需要跳过当前队列头部的一些旧数据）
-    // 我们必须丢弃 m_ring_buffer_tail 之前直到 m_logical_position 的数据
-    // ---------------------------------------------------------
-    // 3. RingBuffer 读取 (支持保留历史数据)
-    // ---------------------------------------------------------
-
     while (total_read < size)
     {
-        // 计算 Buffer 的绝对范围 (Snapshot of current state)
-        int64_t buf_start = m_download_position - m_rb_bytes_available;
-        int64_t buf_end = m_download_position;
+        int64_t current_pos = m_logical_position;
 
-        // [CRITICAL FIX] 检查 Lag (Backward Jump) 情况
-        // 如果逻辑位置在缓冲区开始之前，说明我们也需要等待重置完成
-        // 否则 avail_in_buffer 会计算出巨大的正数(因为减去更小的数)，导致 offset 下溢
-        int64_t avail_in_buffer = 0;
-        
-        if (m_logical_position < buf_start) 
+        // EOF 检查
+        if (m_total_size > 0 && current_pos >= m_total_size)
+            break;
+
+        int64_t block_num = current_pos / LRU_BLOCK_SIZE;
+        size_t block_offset = (size_t)(current_pos % LRU_BLOCK_SIZE);
+
+        // ---------------------------------------------------------
+        // 1. 检查 LRU 块缓存
+        // ---------------------------------------------------------
         {
-            // Lag: We are behind. No data available.
-            avail_in_buffer = 0;
+            std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+            if (g_lru_cache.url == m_file_url)
+            {
+                const uint8_t* block_data = nullptr;
+                size_t block_valid_size = 0;
+                if (g_lru_cache.Get(block_num, block_data, block_valid_size))
+                {
+                    if (block_offset < block_valid_size)
+                    {
+                        size_t avail = block_valid_size - block_offset;
+                        size_t to_copy = std::min(size - total_read, avail);
+                        memcpy(buffer + total_read, block_data + block_offset, to_copy);
+                        total_read += to_copy;
+                        m_logical_position += to_copy;
+                        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: LRU 命中 Block#%lld, Offset: %zu, Copy: %zu", block_num, block_offset, to_copy);
+                        continue; // 处理下一块
+                    }
+                    // block_offset >= block_valid_size: 这是 EOF 处的部分块，且已经读过了
+                    break;
+                }
+            }
         }
-        else
+
+        // ---------------------------------------------------------
+        // 2. LRU 未命中 - 从 RingBuffer 获取数据填充 LRU
+        // ---------------------------------------------------------
+
+        // 延迟启动 Worker
+        if (!m_worker_thread.joinable())
         {
-            // Normal or Too Far (Wait)
-            avail_in_buffer = buf_end - m_logical_position;
+            StartWorker();
         }
 
-        if (avail_in_buffer <= 0)
-        {
-            // [FIX DEADLOCK]: Seek 导致的死锁修复
-            // 当 Seek 向前跳跃 (gap within plan) 时，m_logical_position 超过了 m_download_position。
-            // 此时 Reader 进入 wait (等待数据下载)。
-            // 但如果缓冲区已满 (m_rb_bytes_available == Size)，Writer 线程正阻塞在 wait(m_cv_writer) 等待空间。
-            // Reader 等 Writer，Writer 等 Reader -> 死锁。
-            // 解决方法：在 Reader 进入 wait 前，检查是否因为 Seek 跳过了旧数据，导致可以释放大量空间。
-            // 如果 "已消费+跳过" 的历史数据量 >HistorySize，则主动丢弃，释放 m_rb_bytes_available 并唤醒 Writer。
+        // 计算目标块的绝对范围
+        int64_t block_start = block_num * (int64_t)LRU_BLOCK_SIZE;
+        int64_t block_end_ideal = block_start + (int64_t)LRU_BLOCK_SIZE;
+        if (m_total_size > 0)
+            block_end_ideal = std::min(block_end_ideal, m_total_size);
 
-            int64_t effective_history = m_logical_position - buf_start; // 从 Buffer 起始点到当前请求点的距离
+        std::unique_lock<std::mutex> rb_lock(m_ring_buffer_mutex);
+
+        // 内循环: 等待 RingBuffer 中出现完整块数据
+        bool block_populated = false;
+        while (true)
+        {
+            int64_t buf_start = m_download_position - m_rb_bytes_available;
+            int64_t buf_end = m_download_position;
+
+            // 如果到了 EOF，调整块尾边界
+            int64_t block_end = block_end_ideal;
+            if (m_is_eof && m_download_position < block_end)
+                block_end = m_download_position;
+            // 如果 total_size 在运行中被动态修正
+            if (m_total_size > 0 && block_end > m_total_size)
+                block_end = m_total_size;
+
+            size_t block_size = 0;
+            if (block_end > block_start)
+                block_size = (size_t)(block_end - block_start);
+
+            // 检查 RingBuffer 是否覆盖了整个块
+            if (block_size > 0 && block_start >= buf_start && block_end <= buf_end)
+            {
+                // ----- 从环形缓冲区提取块数据 -----
+                std::vector<uint8_t> block_data(block_size);
+                size_t offset_from_tail = (size_t)(block_start - buf_start);
+                size_t read_ptr = (m_ring_buffer_tail + offset_from_tail) % m_ring_buffer_size;
+
+                size_t copied = 0;
+                while (copied < block_size)
+                {
+                    size_t space_to_end = m_ring_buffer_size - read_ptr;
+                    size_t chunk = std::min(block_size - copied, space_to_end);
+                    memcpy(block_data.data() + copied, ring_buffer.data() + read_ptr, chunk);
+                    read_ptr = (read_ptr + chunk) % m_ring_buffer_size;
+                    copied += chunk;
+                }
+
+                // ----- Lazy Pruning: 释放 RingBuffer 中已不需要的旧数据 -----
+                int64_t prune_point = block_start;
+                int64_t history = prune_point - buf_start;
+                if (history > (int64_t)m_cfg_history_size)
+                {
+                    size_t bytes_to_drop = (size_t)(history - (int64_t)m_cfg_history_size);
+                    if (bytes_to_drop > m_rb_bytes_available)
+                        bytes_to_drop = m_rb_bytes_available;
+                    if (bytes_to_drop > 0)
+                    {
+                        m_ring_buffer_tail = (m_ring_buffer_tail + bytes_to_drop) % m_ring_buffer_size;
+                        m_rb_bytes_available -= bytes_to_drop;
+                        m_cv_writer.notify_one();
+                    }
+                }
+
+                // 释放 RingBuffer 锁后写入 LRU (避免双锁)
+                rb_lock.unlock();
+
+                // ----- 写入 LRU 缓存 -----
+                {
+                    std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                    g_lru_cache.Put(block_num, block_data.data(), block_size);
+                }
+
+                // ----- 拷贝到输出 -----
+                if (block_offset < block_size)
+                {
+                    size_t avail = block_size - block_offset;
+                    size_t to_copy = std::min(size - total_read, avail);
+                    memcpy(buffer + total_read, block_data.data() + block_offset, to_copy);
+                    total_read += to_copy;
+                    m_logical_position += to_copy;
+                }
+
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: RingBuffer -> LRU Block#%lld (%zu bytes). Read %zu bytes.", block_num, block_size, total_read);
+                block_populated = true;
+                break; // 跳出内循环，继续外循环处理下一块
+            }
+
+            // ----- RingBuffer 中没有目标块数据，需要等待或重置 -----
+
+            // 检查是否需要重置 RingBuffer
+            bool need_reset = false;
+            int64_t plan_limit = buf_end + (int64_t)m_ring_buffer_size;
+
+            if (block_start < buf_start)
+            {
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 落后 (Lag). Block: %lld, BufStart: %lld. 触发瞬移.", block_start, buf_start);
+                need_reset = true;
+            }
+            else if (block_start > plan_limit || (block_start - buf_end) > (16 * 1024 * 1024))
+            {
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 超前 (Too Far/Gap > 16MB). Block: %lld, Limit: %lld, Gap: %lld. 触发瞬移.",
+                    block_start, plan_limit, (int64_t)(block_start - buf_end));
+                need_reset = true;
+            }
+
+            if (need_reset)
+            {
+                m_reset_target_pos = block_start;
+                m_trigger_reset = true;
+                m_abort_transfer = true;
+                m_cv_writer.notify_all();
+                m_has_error = false;
+                m_is_eof = false;
+            }
+
+            // 错误状态 (非重置触发的)
+            if (m_has_error && !need_reset)
+            {
+                return total_read > 0 ? (ssize_t)total_read : -1;
+            }
+
+            // EOF 且 RingBuffer 中无此块数据
+            if (m_is_eof && block_start >= m_download_position)
+            {
+                return total_read;
+            }
+
+            // ----- 死锁预防: 主动释放 RingBuffer 中的旧数据为 Writer 腾出空间 -----
+            int64_t effective_history = block_start - buf_start;
             if (effective_history > (int64_t)m_cfg_history_size)
             {
                 size_t bytes_to_drop = (size_t)(effective_history - (int64_t)m_cfg_history_size);
-                
-                // 限制不能丢弃超过实际拥有的数据
-                if (bytes_to_drop > m_rb_bytes_available) 
+                if (bytes_to_drop > m_rb_bytes_available)
                     bytes_to_drop = m_rb_bytes_available;
-
                 if (bytes_to_drop > 0)
                 {
-                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 死锁预防 - 主动丢弃 %zu bytes (Seek Gap). Avail Before: %zu", 
-                        bytes_to_drop, m_rb_bytes_available);
-
+                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 死锁预防 - 主动丢弃 %zu bytes. Avail Before: %zu", bytes_to_drop, m_rb_bytes_available);
                     m_ring_buffer_tail = (m_ring_buffer_tail + bytes_to_drop) % m_ring_buffer_size;
                     m_rb_bytes_available -= bytes_to_drop;
-                    
-                    // 关键: 唤醒 Writer 起来干活
-                    m_cv_writer.notify_all(); 
-                    
-                    // 重新计算 avail (虽然仍是 <=0，但 Buffer 有空间了，Writer 可以继续跑)
-                    // buf_start = m_download_position - m_rb_bytes_available; 
+                    m_cv_writer.notify_all();
                 }
             }
 
-            // 数据不够，需要等待
-            if (m_is_eof) return total_read; // 已经读到文件末尾
-            if (m_has_error) return -1;
-            
-            // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read Waiting... (Pos: %lld, BufStart: %lld, BufEnd: %lld)", m_logical_position, buf_start, buf_end);
+            // ----- 等待 Worker 填充数据 -----
+            if (m_is_eof) return total_read;
+            if (m_has_error) return total_read > 0 ? (ssize_t)total_read : -1;
 
-            // [Fix] 增加等待超时保护 (改为60秒，不做主动重置)
-            // 原逻辑：15秒超时后会主动触发 Worker 重置 (Seek 重连)
-            // 新逻辑：等待 60 秒，如果还等不到直接报错。网络层的重连交给 Worker 自己处理。
-            if (m_cv_reader.wait_for(lock, std::chrono::seconds(60)) == std::cv_status::timeout)
+            if (m_cv_reader.wait_for(rb_lock, std::chrono::seconds(60)) == std::cv_status::timeout)
             {
-                kodi::Log(ADDON_LOG_ERROR, "FastVFS: Read 严重超时 (60s). 缓冲区无数据，强制返回错误 (-1) 以中断播放。");
-                // 强制返回 -1，即使之前可能读到了一点点数据也不返回了，直接让播放器报错更干脆
-                return -1; 
+                kodi::Log(ADDON_LOG_ERROR, "FastVFS: Read 严重超时 (60s). 返回错误 (-1).");
+                return -1;
             }
 
-            // 被 Worker 唤醒（或有错误/EOF）
-            if (m_has_error) return -1;
-            if (m_is_eof && m_rb_bytes_available == 0) return total_read; // 双重检查
-
-            // 唤醒后重新检查状态
-            if (!m_is_running) return -1; // 发生重连或停止
-            continue;
+            if (m_has_error) return total_read > 0 ? (ssize_t)total_read : -1;
+            if (m_is_eof && m_rb_bytes_available == 0) return total_read;
+            if (!m_is_running) return -1;
+            // 继续内循环，重新检查 RingBuffer
         }
 
-        size_t current_need = size - total_read;
-        size_t to_read = std::min(current_need, (size_t)avail_in_buffer);
-
-        // 计算读取起始指针
-        // m_logical_position 一定 >= buf_start (否则上面已经进入 wait)
-        size_t offset_from_tail = (size_t)(m_logical_position - buf_start);
-        size_t read_ptr = (m_ring_buffer_tail + offset_from_tail) % m_ring_buffer_size;
-
-        // 执行拷贝 (处理 Ring Wrap)
-        size_t copied = 0;
-        while (copied < to_read)
-        {
-            size_t space_to_end = m_ring_buffer_size - read_ptr;
-            size_t chunk = std::min(to_read - copied, space_to_end);
-            
-            memcpy(buffer + total_read + copied, ring_buffer.data() + read_ptr, chunk);
-            
-            read_ptr = (read_ptr + chunk) % m_ring_buffer_size;
-            copied += chunk;
-        }
-
-        total_read += to_read;
-        m_logical_position += to_read;
-        
-        // -----------------------------------------------------
-        // Lazy Pruning: 检查并丢弃过老的历史数据
-        // -----------------------------------------------------
-        // 注意：这里我们使用最新的 m_logical_position 和当前的 buf_start 比较
-        // buf_start (tail) 只有在这里才会被修改
-        
-        int64_t current_history = m_logical_position - buf_start; 
-        if (current_history > (int64_t)m_cfg_history_size)
-        {
-            size_t bytes_to_drop = (size_t)(current_history - (int64_t)m_cfg_history_size);
-            // 限制不超过 m_rb_bytes_available (虽不应发生)
-            if (bytes_to_drop > m_rb_bytes_available) bytes_to_drop = m_rb_bytes_available;
-
-            if (bytes_to_drop > 0)
-            {
-                m_ring_buffer_tail = (m_ring_buffer_tail + bytes_to_drop) % m_ring_buffer_size;
-                m_rb_bytes_available -= bytes_to_drop;
-                m_cv_writer.notify_one(); // 通知 Worker 有空位
-            }
-        }
+        if (!block_populated)
+            break; // 无法获取块数据，退出外循环
     }
 
     return total_read;
@@ -2223,79 +1918,4 @@ int64_t CCurlBuffer::Seek(int64_t position, int whence)
     return m_logical_position;
 }
 
-bool CCurlBuffer::CreateMiddleCache(int64_t start_pos)
-{
-    // 简化逻辑：只要曾经建立过热点缓存，就认为已就绪 (返回 true)
-    if (m_middle_valid_from != -1) 
-    {
-        return true;
-    }
-    
-    // **全局缓存检查**: 如果当前实例没有，先查查全局有没有
-    {
-        std::lock_guard<std::mutex> lock(g_data_cache_mutex);
-        if (g_data_cache.url == m_file_url && g_data_cache.middle_valid_from != -1)
-        {
-            m_middle_buffer = g_data_cache.middle_buffer;
-            m_middle_valid_from = g_data_cache.middle_valid_from;
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 复用全局热点缓存. Valid: %lld", m_middle_valid_from);
-            return true;
-        }
-    }
 
-    // 计算预计下载大小 (处理 EOF 边界)
-    size_t expected_size = m_cfg_middle_size;
-    if (m_total_size > 0 && start_pos + (int64_t)expected_size > m_total_size)
-    {
-        int64_t remaining = m_total_size - start_pos;
-        if (remaining < 0) remaining = 0;
-        expected_size = (size_t)remaining;
-    }
-
-    if (expected_size == 0) return false;
-
-    // 分配或调整内存
-    if (!m_middle_buffer) {
-        // 场景 A: 首次分配，直接指定大小，一步到位
-        m_middle_buffer = std::make_shared<std::vector<uint8_t>>(expected_size);
-    }
-    else if (m_middle_buffer->size() != expected_size) {
-        // 场景 B: 复用已有内存，仅调整大小
-        m_middle_buffer->resize(expected_size); 
-    }
-
-    // 获取 handle
-    CURL* curl = GetCurlHandleFromPool();
-    if (!curl) return false;
-
-    curl_easy_reset(curl);
-    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 开始同步下载热点数据. Start: %lld, Size: %zu", start_pos, m_middle_buffer->size());
-
-    bool success = DownloadRange(curl, start_pos, m_middle_buffer->size(), *m_middle_buffer);
-    
-    ReturnCurlHandleToPool(curl);
-
-    if (success)
-    {
-        m_middle_valid_from = start_pos;
-        
-        // 更新全局缓存
-        {
-             std::lock_guard<std::mutex> lock(g_data_cache_mutex);
-             if (g_data_cache.url == m_file_url)
-             {
-                 g_data_cache.middle_buffer = m_middle_buffer;
-                 g_data_cache.middle_valid_from = m_middle_valid_from;
-             }
-        }
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 热点数据下载成功.");
-        return true;
-    }
-    else
-    {
-        kodi::Log(ADDON_LOG_ERROR, "FastVFS: [JIT] 热点数据下载失败.");
-        // 失败意味着没法用 Cache
-        m_middle_valid_from = -1;
-        return false;
-    }
-}

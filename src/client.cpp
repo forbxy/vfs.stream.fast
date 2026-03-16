@@ -49,26 +49,10 @@ kodi::addon::VFSFileHandle CClientVFS::Open(const kodi::addon::VFSUrl &url)
     CCurlBuffer *file = new CCurlBuffer();
 
     // 读取设置
-    // kodi::GetSettingInt 定义在 kodi namespace 下
-    file->m_cfg_head_size = (size_t)MyGetSettingInt("head_size", 30) * 1024 * 1024;
-    file->m_cfg_tail_size = (size_t)MyGetSettingInt("tail_size", 30) * 1024 * 1024;
-    file->m_cfg_middle_size = (size_t)MyGetSettingInt("middle_size", 20) * 1024 * 1024;
-    
     size_t ahead_size = (size_t)MyGetSettingInt("ahead_size", 100) * 1024 * 1024;
     file->m_cfg_history_size = (size_t)MyGetSettingInt("history_size", 10) * 1024 * 1024;
     
     file->m_cfg_ring_size = ahead_size + file->m_cfg_history_size;
-
-    file->m_cfg_preload_thresh = (int64_t)MyGetSettingInt("preload_thresh", 10) * 1024 * 1024 * 1024;
-    
-    // [New] 读取 Only ISO Cache 选项 (默认 true)
-    using namespace kodi::addon;
-    bool cache_iso_only = true; 
-    if (CPrivateBase::m_interface && CPrivateBase::m_interface->toKodi && CPrivateBase::m_interface->toKodi->kodi_addon) {
-        CPrivateBase::m_interface->toKodi->kodi_addon->get_setting_bool(
-          CPrivateBase::m_interface->toKodi->kodiBase, "cache_iso_only", &cache_iso_only);
-    }
-    file->m_cfg_cache_iso_only = cache_iso_only;
 
     // [New] 读取跳转缓存 TTL (默认 4 小时)
     int ttl_hours = MyGetSettingInt("redirect_cache_ttl", 4);
@@ -78,9 +62,9 @@ kodi::addon::VFSFileHandle CClientVFS::Open(const kodi::addon::VFSUrl &url)
 
     // [New] Fail Fast (Quick Timeout Reconnect)
     bool fail_fast = false;
-    if (CPrivateBase::m_interface && CPrivateBase::m_interface->toKodi && CPrivateBase::m_interface->toKodi->kodi_addon) {
-        CPrivateBase::m_interface->toKodi->kodi_addon->get_setting_bool(
-          CPrivateBase::m_interface->toKodi->kodiBase, "fail_fast", &fail_fast);
+    if (kodi::addon::CPrivateBase::m_interface && kodi::addon::CPrivateBase::m_interface->toKodi && kodi::addon::CPrivateBase::m_interface->toKodi->kodi_addon) {
+        kodi::addon::CPrivateBase::m_interface->toKodi->kodi_addon->get_setting_bool(
+          kodi::addon::CPrivateBase::m_interface->toKodi->kodiBase, "fail_fast", &fail_fast);
     }
     if (fail_fast) {
         file->m_net_connect_timeout_sec = 3;
@@ -92,10 +76,10 @@ kodi::addon::VFSFileHandle CClientVFS::Open(const kodi::addon::VFSUrl &url)
         file->m_net_range_total_timeout_sec = 10;
     }
 
-    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Config -> H/T/M/R/His = %zu/%zu/%zu/%zu/%zu MB, Pre = %lld GB, ISOOnly=%d, FailFast=%d",
-        file->m_cfg_head_size >> 20, file->m_cfg_tail_size >> 20, file->m_cfg_middle_size >> 20, 
-        file->m_cfg_ring_size >> 20, file->m_cfg_history_size >> 20, file->m_cfg_preload_thresh >> 30,
-        file->m_cfg_cache_iso_only, fail_fast);
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Config -> Ring/His = %zu/%zu MB, LRU = %zu MB (%zu blocks x %zu KB), FailFast=%d",
+        file->m_cfg_ring_size >> 20, file->m_cfg_history_size >> 20, 
+        CCurlBuffer::LRU_TOTAL_SIZE >> 20, CCurlBuffer::LRU_MAX_BLOCKS, CCurlBuffer::LRU_BLOCK_SIZE >> 10,
+        fail_fast);
 
     // 初始化我们的加速器
     // 这里传入完整的 VFSUrl 对象，因为我们需要里面的 auth 信息

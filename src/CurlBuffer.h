@@ -45,20 +45,15 @@ public:
     // -----------------------------------------------------------------------
     // 可配置参数区 (Configuration)
     // -----------------------------------------------------------------------
-    size_t m_cfg_head_size = 30 * 1024 * 1024;    // 头部热点缓存大小
-    size_t m_cfg_tail_size = 30 * 1024 * 1024;    // 尾部热点缓存大小
-    size_t m_cfg_middle_size = 20 * 1024 * 1024;  // 中间热点(JIT)缓存大小
+    static constexpr size_t LRU_BLOCK_SIZE = 1024 * 1024;          // LRU 块大小 (1MB, 与 GetChunkSize 一致)
+    static constexpr size_t LRU_TOTAL_SIZE = 100 * 1024 * 1024;    // LRU 总大小 100MB
+    static constexpr size_t LRU_MAX_BLOCKS = LRU_TOTAL_SIZE / LRU_BLOCK_SIZE; // 100 块
+
     size_t m_cfg_ring_size = 100 * 1024 * 1024;   // 主 RingBuffer 大小
     size_t m_cfg_history_size = 10 * 1024 * 1024; // 保留历史数据大小
-    int64_t m_cfg_preload_thresh = 10LL * 1024 * 1024 * 1024;   // <10GB 跳过预热(Preload Head/Tail)
-    bool m_cfg_cache_iso_only = true; // [New] 仅 ISO 开启缓存
 
     // 跳转记录缓存时间 (秒)
     long m_cfg_redirect_cache_ttl_sec = 14400;
-
-    // [New] 动态缓存屏蔽阈值
-    std::atomic<bool> m_disable_static_caches{false};
-    std::atomic<int64_t> m_accumulated_download_bytes{0};
 
     // -----------------------------------------------------------------------
     // Network Timeouts & Limits
@@ -91,7 +86,6 @@ protected:
     size_t HandleWrite(void *contents, size_t size);
 
     // 缓存填充专用
-    bool PreloadCaches(); // 统一预热函数
     bool DownloadRange(CURL* curl, int64_t start, int64_t length, std::vector<uint8_t>& buffer);
     static size_t CacheWriteCallback(void *contents, size_t size, size_t nmemb, void *userp);
 
@@ -140,20 +134,7 @@ private:
     size_t m_ring_buffer_tail = 0;
     size_t m_rb_bytes_available = 0;
 
-    // 2. 头部静态缓存 (0 - 30MB)
-    std::shared_ptr<std::vector<uint8_t>> m_head_buffer;
-    size_t m_head_valid_length = 0;
 
-    // 3. 尾部静态缓存 (Total-30MB - Total)
-    std::shared_ptr<std::vector<uint8_t>> m_tail_buffer;
-    int64_t m_tail_valid_from = -1; // -1 无效
-    // 4. 中间热点缓存 (JIT Cache - 20MB)
-    std::shared_ptr<std::vector<uint8_t>> m_middle_buffer;
-    int64_t m_middle_valid_from = -1; // -1 无效
-    // [New] 标记是否为小文件全量缓存模式
-    bool m_is_small_file_mode = false; 
-
-    bool CreateMiddleCache(int64_t start_pos);
     std::mutex m_ring_buffer_mutex;
     std::condition_variable m_cv_reader; // 读者等数据
     std::condition_variable m_cv_writer; // 写者等空间
