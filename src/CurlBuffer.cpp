@@ -12,53 +12,79 @@
 #include <list>
 #include <unordered_map>
 #include <sstream>
+#include <memory>
+
+size_t CCurlBuffer::LRU_BLOCK_SIZE = 1 * 1024 * 1024;
+size_t CCurlBuffer::LRU_TOTAL_SIZE = 100 * 1024 * 1024;
+size_t CCurlBuffer::LRU_MAX_BLOCKS = CCurlBuffer::LRU_TOTAL_SIZE / CCurlBuffer::LRU_BLOCK_SIZE;
 
 // -----------------------------------------------------------------------------------------
 // 全局 LRU 块缓存 (Global LRU Block Cache)
 // -----------------------------------------------------------------------------------------
 // 替代原有的 Head/Tail/Middle 静态缓存，使用统一的 LRU 块缓存
 // 块大小 = 1MB (与 GetChunkSize 一致)，总容量 100MB = 100 块
-// 全局有效，切换文件时自动清空
-struct LRUBlockCache
+// 支持多文件并发: 使用 (url, block_num) 复合键，不同文件的块共存于同一 LRU
+// 块数据使用 shared_ptr，允许多个线程在锁外安全持有数据引用
+
+struct LRUBlockKey
 {
     std::string url;
-    int64_t total_size = 0;
+    int64_t block_num;
 
-    // LRU 链表: front = 最近使用, back = 最久未用
-    std::list<int64_t> lru_order;
-
-    // block_num -> { 在 lru_order 中的迭代器, 块数据 }
-    std::unordered_map<int64_t, std::pair<std::list<int64_t>::iterator, std::vector<uint8_t>>> blocks;
-
-    // 查询块，命中则提升到 MRU 端
-    bool Get(int64_t block_num, const uint8_t*& data, size_t& valid_size)
+    bool operator==(const LRUBlockKey& o) const
     {
-        auto it = blocks.find(block_num);
-        if (it == blocks.end()) return false;
+        return block_num == o.block_num && url == o.url;
+    }
+};
+
+struct LRUBlockKeyHash
+{
+    size_t operator()(const LRUBlockKey& k) const
+    {
+        size_t h1 = std::hash<std::string>{}(k.url);
+        size_t h2 = std::hash<int64_t>{}(k.block_num);
+        return h1 ^ (h2 * 2654435761ULL); // Knuth multiplicative hash
+    }
+};
+
+struct LRUBlockCache
+{
+    // LRU 链表: front = 最近使用, back = 最久未用
+    std::list<LRUBlockKey> lru_order;
+
+    // (url, block_num) -> { 在 lru_order 中的迭代器, 块数据(shared_ptr) }
+    std::unordered_map<LRUBlockKey,
+        std::pair<std::list<LRUBlockKey>::iterator, std::shared_ptr<std::vector<uint8_t>>>,
+        LRUBlockKeyHash> blocks;
+
+    // 查询块，命中则提升到 MRU 端，返回 shared_ptr (调用方可在锁外安全使用)
+    std::shared_ptr<std::vector<uint8_t>> Get(const std::string& url, int64_t block_num)
+    {
+        LRUBlockKey key{url, block_num};
+        auto it = blocks.find(key);
+        if (it == blocks.end()) return nullptr;
         lru_order.splice(lru_order.begin(), lru_order, it->second.first);
-        data = it->second.second.data();
-        valid_size = it->second.second.size();
-        return true;
+        return it->second.second;
     }
 
     // 插入块 (自动驱逐最久未用的块)
-    void Put(int64_t block_num, const uint8_t* data, size_t size)
+    void Put(const std::string& url, int64_t block_num, const uint8_t* data, size_t size)
     {
-        auto it = blocks.find(block_num);
+        LRUBlockKey key{url, block_num};
+        auto it = blocks.find(key);
         if (it != blocks.end())
         {
-            it->second.second.assign(data, data + size);
+            it->second.second = std::make_shared<std::vector<uint8_t>>(data, data + size);
             lru_order.splice(lru_order.begin(), lru_order, it->second.first);
             return;
         }
         while (blocks.size() >= CCurlBuffer::LRU_MAX_BLOCKS && !lru_order.empty())
         {
-            int64_t victim = lru_order.back();
+            blocks.erase(lru_order.back());
             lru_order.pop_back();
-            blocks.erase(victim);
         }
-        lru_order.push_front(block_num);
-        blocks[block_num] = { lru_order.begin(), std::vector<uint8_t>(data, data + size) };
+        lru_order.push_front(key);
+        blocks[key] = { lru_order.begin(), std::make_shared<std::vector<uint8_t>>(data, data + size) };
     }
 
     void Clear()
@@ -66,21 +92,32 @@ struct LRUBlockCache
         lru_order.clear();
         blocks.clear();
     }
-
-    // 切换文件时重置
-    void Reset(const std::string& new_url, int64_t new_total_size)
-    {
-        if (url != new_url)
-        {
-            Clear();
-            url = new_url;
-        }
-        total_size = new_total_size;
-    }
 };
 
 static LRUBlockCache g_lru_cache;
 static std::mutex g_lru_cache_mutex;
+
+void CCurlBuffer::UpdateLRUSettings(size_t block_size, size_t total_size)
+{
+    std::lock_guard<std::mutex> lock(g_lru_cache_mutex);
+    if (LRU_BLOCK_SIZE != block_size) {
+        // 块大小改变会导致现有 block_num 计算失效，所以必须清空
+        g_lru_cache.Clear();
+    }
+    
+    LRU_BLOCK_SIZE = block_size;
+    LRU_TOTAL_SIZE = total_size;
+    
+    if (LRU_BLOCK_SIZE == 0) LRU_BLOCK_SIZE = 1 * 1024 * 1024; // 兜底
+    LRU_MAX_BLOCKS = LRU_TOTAL_SIZE / LRU_BLOCK_SIZE;
+
+    // 清理超出的块
+    while (g_lru_cache.blocks.size() > LRU_MAX_BLOCKS && !g_lru_cache.lru_order.empty())
+    {
+        g_lru_cache.blocks.erase(g_lru_cache.lru_order.back());
+        g_lru_cache.lru_order.pop_back();
+    }
+}
 
 // -----------------------------------------------------------------------------------------
 // 全局 Stat 缓存 (Metadata Cache)
@@ -526,10 +563,8 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     // 保存原始地址以用作缓存 Key
     std::string original_url = m_file_url;
     
-    // [Init] 初始化 ISO 标志
-    std::string ext = GetFileExtensionFromUrl(original_url);
-    m_is_iso = (ext == "iso");
     // [Init] 初始化 Video 标志
+    std::string ext = GetFileExtensionFromUrl(original_url);
     m_is_video = (ext == "mkv" || ext=="iso" || ext == "mp4" || ext == "avi" || ext == "mov" ||  
                   ext == "wmv" || ext == "flv" || ext == "webm" || ext == "m2ts" || 
                   ext == "ts" || ext == "bdmv" || ext == "ifo" || ext == "3gp" ||
@@ -1008,14 +1043,6 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
     if (!Stat(url))
     {
         return false;
-    }
-
-    // -------------------------------------------------------------
-    // LRU 缓存重置 (文件切换时清空)
-    // -------------------------------------------------------------
-    {
-        std::lock_guard<std::mutex> lock(g_lru_cache_mutex);
-        g_lru_cache.Reset(m_file_url, m_total_size);
     }
 
     // -------------------------------------------------------------
@@ -1678,26 +1705,27 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
         // 1. 检查 LRU 块缓存
         // ---------------------------------------------------------
         {
-            std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
-            if (g_lru_cache.url == m_file_url)
+            std::shared_ptr<std::vector<uint8_t>> block_ptr;
             {
-                const uint8_t* block_data = nullptr;
-                size_t block_valid_size = 0;
-                if (g_lru_cache.Get(block_num, block_data, block_valid_size))
+                std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                block_ptr = g_lru_cache.Get(m_file_url, block_num);
+            }
+            // shared_ptr 允许在锁外安全使用数据，即使其他线程驱逐了该块
+            if (block_ptr)
+            {
+                size_t block_valid_size = block_ptr->size();
+                if (block_offset < block_valid_size)
                 {
-                    if (block_offset < block_valid_size)
-                    {
-                        size_t avail = block_valid_size - block_offset;
-                        size_t to_copy = std::min(size - total_read, avail);
-                        memcpy(buffer + total_read, block_data + block_offset, to_copy);
-                        total_read += to_copy;
-                        m_logical_position += to_copy;
-                        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: LRU 命中 Block#%lld, Offset: %zu, Copy: %zu", block_num, block_offset, to_copy);
-                        continue; // 处理下一块
-                    }
-                    // block_offset >= block_valid_size: 这是 EOF 处的部分块，且已经读过了
-                    break;
+                    size_t avail = block_valid_size - block_offset;
+                    size_t to_copy = std::min(size - total_read, avail);
+                    memcpy(buffer + total_read, block_ptr->data() + block_offset, to_copy);
+                    total_read += to_copy;
+                    m_logical_position += to_copy;
+                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: LRU 命中 Block#%lld, Offset: %zu, Copy: %zu", block_num, block_offset, to_copy);
+                    continue; // 处理下一块
                 }
+                // block_offset >= block_valid_size: 这是 EOF 处的部分块，且已经读过了
+                break;
             }
         }
 
@@ -1778,7 +1806,7 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
                 // ----- 写入 LRU 缓存 -----
                 {
                     std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
-                    g_lru_cache.Put(block_num, block_data.data(), block_size);
+                    g_lru_cache.Put(m_file_url, block_num, block_data.data(), block_size);
                 }
 
                 // ----- 拷贝到输出 -----

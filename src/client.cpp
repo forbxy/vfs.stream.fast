@@ -54,6 +54,10 @@ kodi::addon::VFSFileHandle CClientVFS::Open(const kodi::addon::VFSUrl &url)
     
     file->m_cfg_ring_size = ahead_size + file->m_cfg_history_size;
 
+    size_t lru_block_size = (size_t)MyGetSettingInt("lru_block_size", 1) * 1024 * 1024;
+    size_t lru_total_size = (size_t)MyGetSettingInt("lru_total_size", 100) * 1024 * 1024;
+    CCurlBuffer::UpdateLRUSettings(lru_block_size, lru_total_size);
+
     // [New] 读取跳转缓存 TTL (默认 4 小时)
     int ttl_hours = MyGetSettingInt("redirect_cache_ttl", 4);
     if (ttl_hours > 0) {

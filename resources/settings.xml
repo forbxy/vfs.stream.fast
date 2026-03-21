@@ -3,36 +3,6 @@
     <section id="vfs.stream.fast">
         <category id="general" label="30001">
             <group id="1" label="30001">
-                <setting id="head_size" type="integer" label="30002">
-                    <level>0</level>
-                    <default>32</default>
-                    <constraints>
-                        <minimum>8</minimum>
-                        <maximum>100</maximum>
-                        <step>4</step>
-                    </constraints>
-                    <control type="slider" format="integer" />
-                </setting>
-                <setting id="tail_size" type="integer" label="30003">
-                    <level>0</level>
-                    <default>32</default>
-                    <constraints>
-                        <minimum>8</minimum>
-                        <maximum>100</maximum>
-                        <step>4</step>
-                    </constraints>
-                    <control type="slider" format="integer" />
-                </setting>
-                <setting id="middle_size" type="integer" label="30004">
-                    <level>0</level>
-                    <default>20</default>
-                    <constraints>
-                        <minimum>8</minimum>
-                        <maximum>100</maximum>
-                        <step>4</step>
-                    </constraints>
-                    <control type="slider" format="integer" />
-                </setting>
                 <setting id="ahead_size" type="integer" label="30005">
                     <level>0</level>
                     <default>100</default>
@@ -53,21 +23,6 @@
                     </constraints>
                     <control type="slider" format="integer" />
                 </setting>
-                <setting id="preload_thresh" type="integer" label="30007">
-                    <level>0</level>
-                    <default>10</default>
-                    <constraints>
-                        <minimum>1</minimum>
-                        <maximum>200</maximum>
-                        <step>1</step>
-                    </constraints>
-                    <control type="slider" format="integer" />
-                </setting>
-                <setting id="cache_iso_only" type="boolean" label="30008">
-                    <level>0</level>
-                    <default>true</default>
-                    <control type="toggle" />
-                </setting>
                 <setting id="fail_fast" type="boolean" label="30009">
                     <level>0</level>
                     <default>false</default>
@@ -82,8 +37,26 @@
                         <step>1</step>
                     </constraints>
                     <control type="slider" format="integer" />
+                </setting>                <setting id="lru_block_size" type="integer" label="30011">
+                    <level>0</level>
+                    <default>1</default>
+                    <constraints>
+                        <minimum>1</minimum>
+                        <maximum>10</maximum>
+                        <step>1</step>
+                    </constraints>
+                    <control type="slider" format="integer" />
                 </setting>
-            </group>
+                <setting id="lru_total_size" type="integer" label="30012">
+                    <level>0</level>
+                    <default>100</default>
+                    <constraints>
+                        <minimum>10</minimum>
+                        <maximum>1024</maximum>
+                        <step>10</step>
+                    </constraints>
+                    <control type="slider" format="integer" />
+                </setting>            </group>
         </category>
     </section>
 </settings>

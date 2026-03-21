@@ -45,9 +45,10 @@ public:
     // -----------------------------------------------------------------------
     // 可配置参数区 (Configuration)
     // -----------------------------------------------------------------------
-    static constexpr size_t LRU_BLOCK_SIZE = 1024 * 1024;          // LRU 块大小 (1MB, 与 GetChunkSize 一致)
-    static constexpr size_t LRU_TOTAL_SIZE = 100 * 1024 * 1024;    // LRU 总大小 100MB
-    static constexpr size_t LRU_MAX_BLOCKS = LRU_TOTAL_SIZE / LRU_BLOCK_SIZE; // 100 块
+    static size_t LRU_BLOCK_SIZE;          // LRU 块大小
+    static size_t LRU_TOTAL_SIZE;          // LRU 总大小
+    static size_t LRU_MAX_BLOCKS;          // LRU 最大块数
+    static void UpdateLRUSettings(size_t block_size, size_t total_size);
 
     size_t m_cfg_ring_size = 100 * 1024 * 1024;   // 主 RingBuffer 大小
     size_t m_cfg_history_size = 10 * 1024 * 1024; // 保留历史数据大小
@@ -76,7 +77,6 @@ protected:
     // 状态变量
     bool m_support_range = true;
     bool m_is_directory = false;
-    bool m_is_iso = false; // [New] 标记是否为 ISO 文件
     bool m_is_video = false; 
     time_t m_mod_time = 0;
     time_t m_access_time = 0;
