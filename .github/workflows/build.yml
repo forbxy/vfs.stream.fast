@@ -138,6 +138,9 @@ jobs:
           # 复制 addon.xml
           cp addon.xml $ADDON_ID/
 
+          # 复制 icon
+          cp icon.png $ADDON_ID/
+
           # 复制 resources 目录
           cp -r resources $ADDON_ID/
 

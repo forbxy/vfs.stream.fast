@@ -51,7 +51,6 @@ public:
     static void UpdateLRUSettings(size_t block_size, size_t total_size);
 
     size_t m_cfg_ring_size = 100 * 1024 * 1024;   // 主 RingBuffer 大小
-    size_t m_cfg_history_size = 10 * 1024 * 1024; // 保留历史数据大小
 
     // 跳转记录缓存时间 (秒)
     long m_cfg_redirect_cache_ttl_sec = 14400;

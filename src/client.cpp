@@ -49,10 +49,7 @@ kodi::addon::VFSFileHandle CClientVFS::Open(const kodi::addon::VFSUrl &url)
     CCurlBuffer *file = new CCurlBuffer();
 
     // 读取设置
-    size_t ahead_size = (size_t)MyGetSettingInt("ahead_size", 100) * 1024 * 1024;
-    file->m_cfg_history_size = (size_t)MyGetSettingInt("history_size", 10) * 1024 * 1024;
-    
-    file->m_cfg_ring_size = ahead_size + file->m_cfg_history_size;
+    file->m_cfg_ring_size = (size_t)MyGetSettingInt("ahead_size", 100) * 1024 * 1024;
 
     size_t lru_block_size = (size_t)MyGetSettingInt("lru_block_size", 1) * 1024 * 1024;
     size_t lru_total_size = (size_t)MyGetSettingInt("lru_total_size", 100) * 1024 * 1024;
@@ -80,8 +77,8 @@ kodi::addon::VFSFileHandle CClientVFS::Open(const kodi::addon::VFSUrl &url)
         file->m_net_range_total_timeout_sec = 10;
     }
 
-    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Config -> Ring/His = %zu/%zu MB, LRU = %zu MB (%zu blocks x %zu KB), FailFast=%d",
-        file->m_cfg_ring_size >> 20, file->m_cfg_history_size >> 20, 
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Config -> Ring = %zu MB, LRU = %zu MB (%zu blocks x %zu KB), FailFast=%d",
+        file->m_cfg_ring_size >> 20,
         CCurlBuffer::LRU_TOTAL_SIZE >> 20, CCurlBuffer::LRU_MAX_BLOCKS, CCurlBuffer::LRU_BLOCK_SIZE >> 10,
         fail_fast);
 

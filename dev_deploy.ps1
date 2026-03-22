@@ -64,6 +64,11 @@ try {
     Copy-Item -Path $SourceXml -Destination $TargetDir -Force
     Write-Host "Copied addon.xml"
 
+    if (Test-Path "icon.png") {
+        Copy-Item -Path "icon.png" -Destination $TargetDir -Force
+        Write-Host "Copied icon.png"
+    }
+
     if (Test-Path $SourceResources) {
         Copy-Item -Path $SourceResources -Destination $TargetDir -Recurse -Force
         Write-Host "Copied resources folder"

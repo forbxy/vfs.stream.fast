@@ -13,16 +13,7 @@
                     </constraints>
                     <control type="slider" format="integer" />
                 </setting>
-                <setting id="history_size" type="integer" label="30006">
-                    <level>0</level>
-                    <default>8</default>
-                    <constraints>
-                        <minimum>0</minimum>
-                        <maximum>512</maximum>
-                        <step>4</step>
-                    </constraints>
-                    <control type="slider" format="integer" />
-                </setting>
+
                 <setting id="fail_fast" type="boolean" label="30009">
                     <level>0</level>
                     <default>false</default>
@@ -39,7 +30,7 @@
                     <control type="slider" format="integer" />
                 </setting>                <setting id="lru_block_size" type="integer" label="30011">
                     <level>0</level>
-                    <default>1</default>
+                    <default>2</default>
                     <constraints>
                         <minimum>1</minimum>
                         <maximum>10</maximum>
@@ -51,7 +42,7 @@
                     <level>0</level>
                     <default>100</default>
                     <constraints>
-                        <minimum>10</minimum>
+                        <minimum>40</minimum>
                         <maximum>1024</maximum>
                         <step>10</step>
                     </constraints>

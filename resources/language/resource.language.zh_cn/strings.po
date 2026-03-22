@@ -11,11 +11,7 @@ msgstr "缓存设置"
 
 msgctxt "#30005"
 msgid "Read-Ahead Buffer Size (MB)"
-msgstr "未播放数据缓存大小 (MB)"
-
-msgctxt "#30006"
-msgid "Played Data Buffer Size (MB)"
-msgstr "已播放数据缓存大小 (MB)"
+msgstr "预读缓存大小 (MB)"
 
 msgctxt "#30009"
 msgid "Fast Timeout Mode"

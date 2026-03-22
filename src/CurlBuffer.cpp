@@ -130,8 +130,10 @@ struct StatCacheEntry
     time_t mod_time = 0;
     time_t access_time = 0;
     bool is_dir = false;
-    
-    // 缓存校验信息 (ETag 等，暂略)
+    time_t cached_at = 0; // 缓存写入时间
+
+    static constexpr int TTL_SEC = 60; // 缓存有效期 1 分钟
+    bool IsExpired() const { return (time(nullptr) - cached_at) > TTL_SEC; }
 };
 
 // Key: URL (normalized), Value: StatCacheEntry
@@ -582,7 +584,12 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         if (it != g_stat_cache.end())
         {
             const StatCacheEntry& entry = it->second;
-            if (!entry.exists)
+            if (entry.IsExpired())
+            {
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Cache EXPIRED: %s", m_file_url.c_str());
+                g_stat_cache.erase(it);
+            }
+            else if (!entry.exists)
             {
                 kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Cache HIT (Not Found): %s", m_file_url.c_str());
                 return false;
@@ -979,6 +986,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
             entry.access_time = 0; 
             entry.support_range = m_support_range;
             entry.is_dir = m_is_directory;
+            entry.cached_at = time(nullptr);
             
              kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Success (%s). Size: %lld, Range: %d, Time: %lld, IsDir: %d", 
                  isWebDav ? "WebDAV" : "HTTP", final_size, m_support_range, (int64_t)m_mod_time, m_is_directory);
@@ -994,6 +1002,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
             {
                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Failed (404/410). Code=%ld (Cached as Not Found)", response_code);
                entry.exists = false;
+               entry.cached_at = time(nullptr);
                g_stat_cache[m_file_url] = entry;
             }
             else
@@ -1049,12 +1058,11 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
     // 动态内存策略 (Dynamic Memory Policy)
     // -------------------------------------------------------------
     
-    // 1. 如果文件长度未知 (0)，使用保守的 Buffer 大小 (5MB)
+    // 1. 如果文件长度未知 (0)，使用保守的 Buffer 大小 (10MB)
     if (m_total_size <= 0)
     {
-        m_ring_buffer_size = 5 * 1024 * 1024; // 5MB Conservative Buffer
-        m_cfg_history_size = 0;
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 未知长度 (0) -> 循环缓冲区: %zu bytes (保守模式), 历史回溯: 0 (已禁用)", m_ring_buffer_size);
+        m_ring_buffer_size = 10 * 1024 * 1024; // 10MB Conservative Buffer
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 未知长度 (0) -> 循环缓冲区: %zu bytes (保守模式)", m_ring_buffer_size);
     }
     // 2. RingBuffer 大小: 若文件小于配置的 RingBuffer 大小，Buffer 仅分配文件大小
     else if (m_total_size < (int64_t)m_cfg_ring_size)
@@ -1784,12 +1792,9 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
                     copied += chunk;
                 }
 
-                // ----- Lazy Pruning: 释放 RingBuffer 中已不需要的旧数据 -----
-                int64_t prune_point = block_start;
-                int64_t history = prune_point - buf_start;
-                if (history > (int64_t)m_cfg_history_size)
+                // ----- Lazy Pruning: 释放 RingBuffer 中已读过的旧数据 -----
                 {
-                    size_t bytes_to_drop = (size_t)(history - (int64_t)m_cfg_history_size);
+                    size_t bytes_to_drop = (size_t)(block_start - buf_start);
                     if (bytes_to_drop > m_rb_bytes_available)
                         bytes_to_drop = m_rb_bytes_available;
                     if (bytes_to_drop > 0)
@@ -1865,10 +1870,8 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
             }
 
             // ----- 死锁预防: 主动释放 RingBuffer 中的旧数据为 Writer 腾出空间 -----
-            int64_t effective_history = block_start - buf_start;
-            if (effective_history > (int64_t)m_cfg_history_size)
             {
-                size_t bytes_to_drop = (size_t)(effective_history - (int64_t)m_cfg_history_size);
+                size_t bytes_to_drop = (size_t)(block_start - buf_start);
                 if (bytes_to_drop > m_rb_bytes_available)
                     bytes_to_drop = m_rb_bytes_available;
                 if (bytes_to_drop > 0)

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <addon id="vfs.stream.fast"
-       version="1.2.6"
-       name="Fast Stream VFS"
+       version="1.3.0"
+       name="VFS Stream Fast"
        provider-name="forbxy">
   
   <requires>
@@ -26,10 +26,12 @@
 
   <extension point="xbmc.addon.metadata">
     <platform>all</platform>
-    <summary lang="zh_CN">高性能流媒体加速器</summary>
-    <description lang="zh_CN">提前缓存文件头尾做内存响应，解决kodi无法播放网络链接ISO文件的问题</description>
+    <summary lang="en_GB">High-performance HTTP/WebDAV VFS implementation</summary>
+    <summary lang="zh_CN">高性能http/webdav vfs实现</summary>
+    <description lang="en_GB">Homepage: github.com/forbxy[CR]Features:[CR]1. LRU block cache: optimizes network ISO movie parsing, playback starts in seconds[CR]2. Read-ahead buffer: with default settings, 10s+ network fluctuations are imperceptible[CR]- For STRM usage, see STRM format requirements on the homepage vfs.stream.fast[CR]- For Emby integration, emby-next-gen requires a modified version, see homepage plugin.service.emby-next-gen</description>
+    <description lang="zh_CN">主页:github.com/forbxy[CR]特点:[CR]1.LRU块缓存：优化网络iso电影解析速度，起播只需数秒[CR]2.预读数据：默认参数下，10秒+的网络波动用户无感知[CR]-！如需使用strm，对STRM文件的格式要求见主页vfs.stram.fast!!![CR]-！如需接入emby，emby-next-gen只能使用修改版，具体见主页plugin.service.emby-next-gen</description>
     <assets>
-      <!-- <icon>icon.png</icon> -->
+      <icon>icon.png</icon>
     </assets>
   </extension>
 </addon>
