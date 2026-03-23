@@ -35,8 +35,12 @@ public:
   // 必须返回 true，否则播放器可能会禁用进度条拖动
   bool IoControlGetSeekPossible(kodi::addon::VFSFileHandle context) override { return true; }
   
-  // 告诉 Kodi 我们想要大块读取 (虽然 Kodi 内部通过 CDVDInputStream 可能会自己分片，但也是一种暗示)
-  int GetChunkSize(kodi::addon::VFSFileHandle context) override { return CCurlBuffer::LRU_BLOCK_SIZE; }
+  int GetChunkSize(kodi::addon::VFSFileHandle context) override {
+    CCurlBuffer* buf = (CCurlBuffer*)context;
+    int chunk = (buf && buf->IsRangeSupported()) ? (int)CCurlBuffer::LRU_BLOCK_SIZE : 0;
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: GetChunkSize() called, returning %d", chunk);
+    return chunk;
+  }
 };
 
 // ---------------------------------------------------------------------------

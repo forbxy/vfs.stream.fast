@@ -202,6 +202,7 @@ static bool IsFatalError(CURLcode res)
 {
     static const std::vector<CURLcode> fatal_errors = {
         CURLE_URL_MALFORMAT,
+        CURLE_COULDNT_RESOLVE_HOST, // Error 6: DNS resolution failed
         CURLE_COULDNT_CONNECT,
         CURLE_SSL_CONNECT_ERROR, // Error 35: SSL handshake failed
         CURLE_GOT_NOTHING // Empty reply, usually means server closed connection immediately, retry rarely helps for HEAD
@@ -437,19 +438,11 @@ void CCurlBuffer::UpdateRedirectCacheFromCurl(CURL* curl, const std::string& ori
 
 CCurlBuffer::CCurlBuffer()
 {
-    // 初始化复用的 Curl 对象
-    // curl_handle = GetCurlHandleFromPool();
 }
 
 CCurlBuffer::~CCurlBuffer()
 {
     Close();
-
-    // if (curl_handle)
-    // {
-    //    ReturnCurlHandleToPool(curl_handle);
-    //    curl_handle = nullptr;
-    // }
 }
 
 void CCurlBuffer::Close()
@@ -526,6 +519,12 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
 {
     m_file_url = url.GetURL();
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 调用 Stat(), URL=%s", m_file_url.c_str());
+
+    // 每次 Stat 都重置这些由探测结果驱动的状态，避免沿用上一次实例状态
+    m_support_range = false;
+    m_is_directory = false;
+    m_mod_time = 0;
+    m_access_time = 0;
     
     // [Fix] Url Cleaning: Remove Kodi options (after '|')
     // libcurl 不处理 '|' 及其后的选项，直接发给服务器会导致 400 或 插件崩溃
@@ -637,9 +636,10 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     struct curl_slist *headers = NULL;
     std::string resp_body;
     int retries = 0;
+    constexpr int stat_max_retries = 2;
     char errbuf[CURL_ERROR_SIZE];
 
-    while (retries < m_net_max_retries)
+    while (retries < stat_max_retries)
     {
         curl_easy_reset(curl);
         errbuf[0] = 0;
@@ -684,13 +684,23 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
              }
              break;
         }
+
+        // DNS resolving timeout is usually transient network/DNS issue,
+        // and immediate in-addon retries add delay without improving success rate.
+        if (res == CURLE_OPERATION_TIMEDOUT && std::string(errbuf).find("Resolving timed out") != std::string::npos)
+        {
+            kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat DNS resolving timeout. Skip in-addon retry. Detail: %s", errbuf);
+            std::lock_guard<std::mutex> l(g_redirect_cache_mutex);
+            g_redirect_cache.erase(m_file_url);
+            break;
+        }
         
-        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat Error %d. Retry %d/%d. Detail: %s", res, retries+1, m_net_max_retries, errbuf);
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat Error %d. Retry %d/%d. Detail: %s", res, retries + 1, stat_max_retries, errbuf);
         
         std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url);
         
         retries++;
-        if (retries < m_net_max_retries) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (retries < stat_max_retries) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     if (isWebDav)
@@ -878,8 +888,11 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         }
         else if (res == CURLE_GOT_NOTHING && !is_sensitive_file)
         {
-             kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat HEAD failed with Error 52 (Empty Reply). Server likely does not support HEAD. Fallback to GET 0-1...");
-             need_fallback = true;
+             // 服务器对 HEAD 返回空响应，直接判定为不支持 Range、长度未知
+             kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat HEAD Error 52 (Empty Reply). 判定: 不支持 Range, 长度未知.");
+             m_support_range = false;
+             final_size = 0;
+             response_code = 200; // 视为成功，让后续 Cache 逻辑正确处理
         }
 
         if (need_fallback)
@@ -965,9 +978,6 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         UpdateRedirectCacheFromCurl(curl, m_file_url, "Stat", this);
     }
 
-    // FIXME 应该在拿到最终的链接后使用所有的跳转路径判断文件格式，目前在UpdateRedirectCacheFromCurl
-    // 里更新is_iso标志，和整体的逻辑有点不一致
-
     // ---------------------------------------------------------
     // 3. 更新 Stat Cache (通用)
     // ---------------------------------------------------------
@@ -1020,35 +1030,8 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
 bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
 {
     kodi::Log(ADDON_LOG_INFO, "FastVFS: 正在打开文件: %s", url.GetURL().c_str());
-    m_file_url = url.GetURL();
 
-    // [Fix] Url Cleaning: Remove Kodi options (after '|')
-    size_t pipe_pos = m_file_url.find('|');
-    if (pipe_pos != std::string::npos) {
-        m_file_url = m_file_url.substr(0, pipe_pos);
-    }
-
-    if (IsLikelyDoubleEncoded(m_file_url)) {
-        kodi::Log(ADDON_LOG_WARNING, "FastVFS: [Warning] Open() 检测到可能的二次编码 URL (Count >= 2)! (Contains %%25+Hex)");
-        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Original URL: %s", m_file_url.c_str());
-
-        std::string fixed_url_preview = m_file_url;
-        FixDoubleEncoding(fixed_url_preview);
-        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Fixed URL (Preview): %s", fixed_url_preview.c_str());
-
-        // [Reserved] 自动修复代码保留但不执行
-        if (false) FixDoubleEncoding(m_file_url);
-    }
-
-    m_username = url.GetUsername();
-    m_password = url.GetPassword();
-
-    // 协议修复: 某些版本的 libcurl 只能处理 http/https，不认识 dav/davs
-    if (m_file_url.rfind("dav://", 0) == 0)
-        m_file_url.replace(0, 6, "http://");
-    else if (m_file_url.rfind("davs://", 0) == 0)
-        m_file_url.replace(0, 7, "https://");
-
+    // Stat() 内部会处理 URL 清理、双重编码检测、协议修复、auth 提取
     if (!Stat(url))
     {
         return false;
@@ -1375,11 +1358,39 @@ void CCurlBuffer::WorkerThread()
         }
 
         // ---------------------------------------------------------
-        // Update Redirect Cache
+        // Update Redirect Cache (对所有已建立连接的情况都更新，不仅限于 CURLE_OK)
         // ---------------------------------------------------------
-        if (res == CURLE_OK)
         {
-            UpdateRedirectCacheFromCurl(curl, m_file_url, "Worker", this);
+            long resp_code = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp_code);
+            if (resp_code > 0)
+            {
+                UpdateRedirectCacheFromCurl(curl, m_file_url, "Worker", this);
+            }
+        }
+
+        // 运行时动态纠偏 (CURLE_OK 后的冗余检查，Header 回调已提前处理)
+        if (res == CURLE_OK && !m_support_range)
+        {
+            long response_code = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+
+            bool supports_range_now = (response_code == 206);
+            if (!supports_range_now)
+            {
+                struct curl_header* h = NULL;
+                if (curl_easy_header(curl, "Accept-Ranges", 0, CURLH_HEADER, -1, &h) == CURLHE_OK)
+                {
+                    if (h && h->value && std::string(h->value).find("bytes") != std::string::npos)
+                        supports_range_now = true;
+                }
+            }
+
+            if (supports_range_now)
+            {
+                m_support_range = true;
+                kodi::Log(ADDON_LOG_INFO, "FastVFS: [Dynamic] Worker 检测到最终地址支持 Range，已重新启用 LRU/Range 模式");
+            }
         }
 
         // ---------------------------------------------------------
@@ -1488,8 +1499,6 @@ void CCurlBuffer::WorkerThread()
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Worker 线程退出.");
     ReturnCurlHandleToPool(curl);
 }
-
-// (Function ProgressCallback removed as it is superseded by WorkerProgressCallback)
 
 void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url)
 {
@@ -1618,7 +1627,17 @@ void CCurlBuffer::SetupWorkerDownloadOptions(CURL* curl, const std::string& targ
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CCurlBuffer::WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, this);
     curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 1 * 1024 * 1024);
-    curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)start);
+
+    if (m_support_range)
+    {
+        curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)start);
+    }
+    else
+    {
+        // 不支持 Range 的流必须按顺序连续读取，不能带偏移续传
+        curl_easy_setopt(curl, CURLOPT_RANGE, NULL);
+        curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)0);
+    }
 }
 
 size_t CCurlBuffer::WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
@@ -1700,6 +1719,44 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
 
     while (total_read < size)
     {
+        if (!m_support_range)
+        {
+            if (!m_worker_thread.joinable())
+            {
+                StartWorker();
+            }
+
+            std::unique_lock<std::mutex> rb_lock(m_ring_buffer_mutex);
+
+            while (m_rb_bytes_available == 0)
+            {
+                if (m_is_eof)
+                    return total_read;
+                if (m_has_error)
+                    return total_read > 0 ? (ssize_t)total_read : -1;
+                if (!m_is_running)
+                    return total_read > 0 ? (ssize_t)total_read : -1;
+
+                if (m_cv_reader.wait_for(rb_lock, std::chrono::seconds(60)) == std::cv_status::timeout)
+                {
+                    kodi::Log(ADDON_LOG_ERROR, "FastVFS: 顺序流 Read 严重超时 (60s). 返回错误 (-1).");
+                    return total_read > 0 ? (ssize_t)total_read : -1;
+                }
+            }
+
+            size_t space_to_end = m_ring_buffer_size - m_ring_buffer_tail;
+            size_t to_copy = std::min(size - total_read, std::min(m_rb_bytes_available, space_to_end));
+            memcpy(buffer + total_read, ring_buffer.data() + m_ring_buffer_tail, to_copy);
+
+            m_ring_buffer_tail = (m_ring_buffer_tail + to_copy) % m_ring_buffer_size;
+            m_rb_bytes_available -= to_copy;
+            total_read += to_copy;
+            m_logical_position += to_copy;
+
+            m_cv_writer.notify_one();
+            continue;
+        }
+
         int64_t current_pos = m_logical_position;
 
         // EOF 检查
@@ -1913,9 +1970,10 @@ int64_t CCurlBuffer::Seek(int64_t position, int whence)
     // 例外：Seek 到 0 (通常是刚打开时) 需兼容
     if (!m_support_range)
     {
-        if (whence == SEEK_SET && position == 0)
+        if ((whence == SEEK_SET && position == 0) ||
+            (whence == SEEK_CUR && position == 0))
         {
-            // allowed
+            // allowed: Seek(0) 和 IoControl(IOCTRL_SEEK_POSSIBLE) 兼容
         }
         else
         {

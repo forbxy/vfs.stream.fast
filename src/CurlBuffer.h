@@ -74,7 +74,7 @@ protected:
     void StartWorker(); // 延迟启动 Helper
 
     // 状态变量
-    bool m_support_range = true;
+    bool m_support_range = false;
     bool m_is_directory = false;
     bool m_is_video = false; 
     time_t m_mod_time = 0;
@@ -121,12 +121,7 @@ private:
 
     // 线程
     std::thread m_worker_thread;
-    // CURL *curl_handle = nullptr; // Removed: use pool directly
-
-    // 缓存策略区
-    // 150MB Ring Buffer + 30MB Head + 30MB Tail (Shadow)
-
-    // 1. 环形主缓存
+    // 环形主缓存
     std::vector<uint8_t> ring_buffer;
     size_t m_ring_buffer_size = 0; // 150MB
     size_t m_ring_buffer_head = 0;
