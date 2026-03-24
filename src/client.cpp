@@ -164,3 +164,46 @@ bool CClientVFS::Exists(const kodi::addon::VFSUrl &url)
     kodi::vfs::FileStatus status;
     return Stat(url, status) == 0;
 }
+
+kodi::addon::VFSFileHandle CClientVFS::OpenForWrite(const kodi::addon::VFSUrl &url, bool overWrite)
+{
+    std::string safeUrl = url.GetRedacted();
+    kodi::Log(ADDON_LOG_DEBUG, "Fast Stream VFS: OpenForWrite %s, OverWrite=%d", safeUrl.c_str(), overWrite);
+
+    CCurlBuffer *file = new CCurlBuffer();
+
+    // 复用读取模式的网络配置
+    bool fail_fast = false;
+    if (kodi::addon::CPrivateBase::m_interface && kodi::addon::CPrivateBase::m_interface->toKodi && kodi::addon::CPrivateBase::m_interface->toKodi->kodi_addon) {
+        kodi::addon::CPrivateBase::m_interface->toKodi->kodi_addon->get_setting_bool(
+          kodi::addon::CPrivateBase::m_interface->toKodi->kodiBase, "fail_fast", &fail_fast);
+    }
+    if (fail_fast) {
+        file->m_net_connect_timeout_sec = 3;
+        file->m_net_read_timeout_sec = 5;
+    }
+
+    if (file->OpenForWrite(url, overWrite))
+    {
+        return (kodi::addon::VFSFileHandle)file;
+    }
+
+    delete file;
+    return nullptr;
+}
+
+ssize_t CClientVFS::Write(kodi::addon::VFSFileHandle context, const uint8_t *buffer, size_t uiBufSize)
+{
+    CCurlBuffer *file = (CCurlBuffer *)context;
+    if (!file)
+        return -1;
+    return file->Write(buffer, uiBufSize);
+}
+
+int CClientVFS::Truncate(kodi::addon::VFSFileHandle context, int64_t size)
+{
+    CCurlBuffer *file = (CCurlBuffer *)context;
+    if (!file)
+        return -1;
+    return file->Truncate(size);
+}

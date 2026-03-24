@@ -17,7 +17,13 @@ public:
   // --- 核心 IO 接口 ---
   kodi::addon::VFSFileHandle Open(const kodi::addon::VFSUrl& url) override;
 
+  kodi::addon::VFSFileHandle OpenForWrite(const kodi::addon::VFSUrl& url, bool overWrite) override;
+
   ssize_t Read(kodi::addon::VFSFileHandle context, uint8_t* buffer, size_t uiBufSize) override;
+
+  ssize_t Write(kodi::addon::VFSFileHandle context, const uint8_t* buffer, size_t uiBufSize) override;
+
+  int Truncate(kodi::addon::VFSFileHandle context, int64_t size) override;
 
   int64_t Seek(kodi::addon::VFSFileHandle context, int64_t position, int whence) override;
 
@@ -37,7 +43,7 @@ public:
   
   int GetChunkSize(kodi::addon::VFSFileHandle context) override {
     CCurlBuffer* buf = (CCurlBuffer*)context;
-    int chunk = (buf && buf->IsRangeSupported()) ? (int)CCurlBuffer::LRU_BLOCK_SIZE : 0;
+    int chunk = (buf && buf->IsRangeSupported()) ? 2*1024 : 0;
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: GetChunkSize() called, returning %d", chunk);
     return chunk;
   }

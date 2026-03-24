@@ -27,6 +27,11 @@ public:
     ssize_t Read(uint8_t *buffer, size_t size);
     int64_t Seek(int64_t position, int whence);
 
+    // 写入接口 (参考 Kodi CurlFile 的 multi-interface 模式)
+    bool OpenForWrite(const kodi::addon::VFSUrl &url, bool overWrite);
+    ssize_t Write(const uint8_t *buffer, size_t size);
+    int Truncate(int64_t size);
+
     int64_t GetPosition() const { return m_logical_position; }
     int64_t GetLength() const { return m_total_size; }
     
@@ -99,6 +104,9 @@ protected:
     static void UpdateRedirectCacheFromCurl(CURL* curl, const std::string& original_url, const char* context_name, CCurlBuffer* self = nullptr);
     static std::string GetFileExtensionFromUrl(const std::string& url); // [New] Get Extension Helper
 
+    // 写入模式回调 (curl READFUNCTION, 向服务器上传数据)
+    static size_t UploadReadCallback(char *buffer, size_t size, size_t nitems, void *userp);
+
 private:
     // 基础信息
     std::string m_file_url;
@@ -132,4 +140,18 @@ private:
     std::mutex m_ring_buffer_mutex;
     std::condition_variable m_cv_reader; // 读者等数据
     std::condition_variable m_cv_writer; // 写者等空间
+
+    // ----- 写入模式状态 (Write Mode State) -----
+    bool m_for_write = false;
+    bool m_write_error = false;
+    bool m_write_eof = false;
+    CURL* m_write_curl = nullptr;
+    CURLM* m_write_multi = nullptr;
+    int m_write_still_running = 0;
+
+    // 写入缓冲 (READFUNCTION 回调使用)
+    const uint8_t* m_write_buffer = nullptr;
+    size_t m_write_buffer_size = 0;
+    size_t m_write_buffer_pos = 0;
+    bool m_write_paused = false;
 };

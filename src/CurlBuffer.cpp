@@ -233,7 +233,7 @@ std::string CCurlBuffer::GetFileExtensionFromUrl(const std::string& url)
     if(!h) return extension;
 
     // 解析 URL
-    CURLUcode rc = curl_url_set(h, CURLUPART_URL, url.c_str(), 0);
+    CURLUcode rc = curl_url_set(h, CURLUPART_URL, url.c_str(), CURLU_NON_SUPPORT_SCHEME);
     if(!rc) {
         char *path = NULL;
         // 提取 Path 部分 (会自动去除 ?query 和 #fragment)
@@ -257,6 +257,17 @@ std::string CCurlBuffer::GetFileExtensionFromUrl(const std::string& url)
     }
     curl_url_cleanup(h);
     return extension;
+}
+
+// Replace dav:// with http:// and davs:// with https:// for curl compatibility
+static std::string FixDavProtocol(const std::string& url)
+{
+    std::string fixed = url;
+    if (fixed.rfind("dav://", 0) == 0)
+        fixed.replace(0, 6, "http://");
+    else if (fixed.rfind("davs://", 0) == 0)
+        fixed.replace(0, 7, "https://");
+    return fixed;
 }
 
 // -----------------------------------------------------------------------------------------
@@ -447,7 +458,70 @@ CCurlBuffer::~CCurlBuffer()
 
 void CCurlBuffer::Close()
 {
-    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 调用 Close(), 当前逻辑位置=%lld", m_logical_position);
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 调用 Close(), 当前逻辑位置=%lld, ForWrite=%d", m_logical_position, m_for_write);
+
+    // ----- 写入模式清理 (Write Mode Cleanup) -----
+    if (m_for_write)
+    {
+        // Signal EOF to UploadReadCallback so curl finishes the PUT request gracefully
+        if (m_write_multi && m_write_curl && !m_write_error)
+        {
+            m_write_eof = true;
+            m_write_paused = false;
+            curl_easy_pause(m_write_curl, CURLPAUSE_CONT);
+
+            // Drive multi until transfer completes
+            int still_running = 1;
+            while (still_running)
+            {
+                CURLMcode mc = curl_multi_perform(m_write_multi, &still_running);
+                if (mc != CURLM_OK || !still_running)
+                    break;
+                curl_multi_poll(m_write_multi, NULL, 0, 1000, NULL);
+            }
+
+            // Check final HTTP status
+            CURLMsg *msg;
+            int msgs_left;
+            while ((msg = curl_multi_info_read(m_write_multi, &msgs_left)))
+            {
+                if (msg->msg == CURLMSG_DONE)
+                {
+                    long code = 0;
+                    curl_easy_getinfo(m_write_curl, CURLINFO_RESPONSE_CODE, &code);
+                    if (msg->data.result != CURLE_OK || code >= 400)
+                        kodi::Log(ADDON_LOG_ERROR, "FastVFS: OpenForWrite upload finished with error. HTTP=%ld, CurlCode=%d", code, msg->data.result);
+                    else
+                        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: OpenForWrite upload finished successfully. HTTP=%ld", code);
+                }
+            }
+        }
+
+        if (m_write_multi && m_write_curl)
+        {
+            curl_multi_remove_handle(m_write_multi, m_write_curl);
+        }
+        if (m_write_curl)
+        {
+            curl_easy_cleanup(m_write_curl);
+            m_write_curl = nullptr;
+        }
+        if (m_write_multi)
+        {
+            curl_multi_cleanup(m_write_multi);
+            m_write_multi = nullptr;
+        }
+        m_for_write = false;
+        m_write_error = false;
+        m_write_eof = false;
+        m_write_buffer = nullptr;
+        m_write_buffer_size = 0;
+        m_write_buffer_pos = 0;
+        m_write_paused = false;
+        return;
+    }
+
+    // ----- 读取模式清理 (Read Mode Cleanup) -----
     // 1. 停止标志
     m_is_running = false;
 
@@ -526,7 +600,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     m_mod_time = 0;
     m_access_time = 0;
     
-    // [Fix] Url Cleaning: Remove Kodi options (after '|')
+    // FIXME Url Cleaning: Remove Kodi options (after '|')
     // libcurl 不处理 '|' 及其后的选项，直接发给服务器会导致 400 或 插件崩溃
     size_t pipe_pos = m_file_url.find('|');
     if (pipe_pos != std::string::npos) {
@@ -549,23 +623,8 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     m_username = url.GetUsername();
     m_password = url.GetPassword();
 
-
-    
-
-    // 协议修复: libcurl 不认识 dav://，只认识 http://
-    // [Fix] 检测 WebDAV (Check protocol before modification)
-    bool isWebDav = (m_file_url.rfind("dav://", 0) == 0) || (m_file_url.rfind("davs://", 0) == 0);
-
-    if (m_file_url.rfind("dav://", 0) == 0)
-        m_file_url.replace(0, 6, "http://");
-    else if (m_file_url.rfind("davs://", 0) == 0)
-        m_file_url.replace(0, 7, "https://");
-
-    // 保存原始地址以用作缓存 Key
-    std::string original_url = m_file_url;
-    
     // [Init] 初始化 Video 标志
-    std::string ext = GetFileExtensionFromUrl(original_url);
+    std::string ext = GetFileExtensionFromUrl(m_file_url);
     m_is_video = (ext == "mkv" || ext=="iso" || ext == "mp4" || ext == "avi" || ext == "mov" ||  
                   ext == "wmv" || ext == "flv" || ext == "webm" || ext == "m2ts" || 
                   ext == "ts" || ext == "bdmv" || ext == "ifo" || ext == "3gp" ||
@@ -576,8 +635,6 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     // 0. 检查全局 Stat 缓存
     // ---------------------------------------------------------
     {
-        // 注意：这里使用 m_file_url (可能是 Redirect 后的) 作为 Key
-        // 这意味着 Redirect Cache 必须先于 Stat Cache 检查
         std::lock_guard<std::mutex> lock(g_stat_cache_mutex);
         auto it = g_stat_cache.find(m_file_url);
         if (it != g_stat_cache.end())
@@ -625,21 +682,20 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
     }
 
-    // =========================================================================
-    // 策略分支: WebDAV (PROPFIND) vs HTTP (HEAD)
-    // =========================================================================
+    // Determine WebDAV flag based on actual request target (after redirect resolution)
+    bool isWebDav = (target_url.rfind("dav://", 0) == 0) || (target_url.rfind("davs://", 0) == 0);
+    
+    // Fix dav:// -> http:// for curl compatibility
+    target_url = FixDavProtocol(target_url);
 
     // =========================================================================
-    // 1. 统一 Stat 重试循环 (WebDAV与HTTP共用)
+    // 策略分支: WebDAV (PROPFIND) vs HTTP (HEAD)
     // =========================================================================
     
     struct curl_slist *headers = NULL;
     std::string resp_body;
-    int retries = 0;
-    constexpr int stat_max_retries = 2;
     char errbuf[CURL_ERROR_SIZE];
 
-    while (retries < stat_max_retries)
     {
         curl_easy_reset(curl);
         errbuf[0] = 0;
@@ -648,9 +704,6 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         if (isWebDav)
         {
              // WebDAV Setup
-             if (headers) { curl_slist_free_all(headers); headers = NULL; }
-             resp_body.clear(); 
-             
              SetupStatWebDavOptions(curl, target_url, &headers);
 
              curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](void* buffer, size_t size, size_t nmemb, void* userp) -> size_t {
@@ -672,35 +725,12 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         // Clean headers
         if (headers) { curl_slist_free_all(headers); headers = NULL; }
 
-        if (res == CURLE_OK) break;
-
-        // Fatal Error Check
-        if (IsFatalError(res))
+        if (res != CURLE_OK)
         {
-             kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat WebDAV/HTTP Fatal Error %d. Aborting. Detail: %s", res, errbuf);
-             if (res != CURLE_GOT_NOTHING) {
-                 std::lock_guard<std::mutex> l(g_redirect_cache_mutex); 
-                 g_redirect_cache.erase(m_file_url); 
-             }
-             break;
-        }
-
-        // DNS resolving timeout is usually transient network/DNS issue,
-        // and immediate in-addon retries add delay without improving success rate.
-        if (res == CURLE_OPERATION_TIMEDOUT && std::string(errbuf).find("Resolving timed out") != std::string::npos)
-        {
-            kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat DNS resolving timeout. Skip in-addon retry. Detail: %s", errbuf);
+            kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat %s Error %d. Detail: %s", isWebDav ? "WebDAV" : "HTTP", res, errbuf);
             std::lock_guard<std::mutex> l(g_redirect_cache_mutex);
             g_redirect_cache.erase(m_file_url);
-            break;
         }
-        
-        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat Error %d. Retry %d/%d. Detail: %s", res, retries + 1, stat_max_retries, errbuf);
-        
-        std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url);
-        
-        retries++;
-        if (retries < stat_max_retries) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     if (isWebDav)
@@ -1015,6 +1045,10 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                entry.cached_at = time(nullptr);
                g_stat_cache[m_file_url] = entry;
             }
+            else if (res == CURLE_OK && (response_code >= 400 && response_code < 500))
+            {
+               kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat Failed. CurCode=%d, HTTP=%ld, URL=%s (Not Cached, allowing retry)", res, response_code, m_file_url.c_str());
+            }
             else
             {
                kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat Error. CurCode=%d, HTTP=%ld, URL=%s (Not Cached, allowing retry)", res, response_code, m_file_url.c_str());
@@ -1181,6 +1215,7 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
         {
             target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
         }
+        target_url = FixDavProtocol(target_url);
     
         // Use new helper
         SetupDownloadRangeOptions(curl, target_url, start, length);
@@ -1345,6 +1380,7 @@ void CCurlBuffer::WorkerThread()
         if (m_is_video) {
             target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
         }
+        target_url = FixDavProtocol(target_url);
 
         SetupWorkerDownloadOptions(curl, target_url, m_download_position);
         
@@ -1517,8 +1553,8 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
     // URL & Auth
     curl_easy_setopt(curl, CURLOPT_URL, target_url.c_str());
 
+    // Don't send credentials to a different host (e.g. CDN after redirect)
     bool should_send_auth = true;
-    if (target_url != m_file_url)
     {
         std::string host_origin = ExtractHost(m_file_url);
         std::string host_target = ExtractHost(target_url);
@@ -1795,7 +1831,39 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
         }
 
         // ---------------------------------------------------------
-        // 2. LRU 未命中 - 从 RingBuffer 获取数据填充 LRU
+        // 2. LRU 未命中 - 小文件直接下载到 LRU (无需 Worker)
+        // ---------------------------------------------------------
+        if (m_total_size > 0 && m_total_size <= (int64_t)LRU_BLOCK_SIZE)
+        {
+            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 小文件优化 (%lld bytes <= LRU_BLOCK_SIZE %zu), 直接 DownloadRange 到 LRU", m_total_size, LRU_BLOCK_SIZE);
+            std::vector<uint8_t> file_data((size_t)m_total_size);
+            CURL* dl_curl = GetCurlHandleFromPool();
+            bool ok = DownloadRange(dl_curl, 0, m_total_size, file_data);
+            ReturnCurlHandleToPool(dl_curl);
+
+            if (ok && !file_data.empty())
+            {
+                {
+                    std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                    g_lru_cache.Put(m_file_url, 0, file_data.data(), file_data.size());
+                }
+                // 从刚写入的数据直接拷贝到输出
+                size_t avail = file_data.size() - block_offset;
+                size_t to_copy = std::min(size - total_read, avail);
+                memcpy(buffer + total_read, file_data.data() + block_offset, to_copy);
+                total_read += to_copy;
+                m_logical_position += to_copy;
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 小文件直接下载成功, 写入 LRU Block#0 (%zu bytes), Read %zu bytes", file_data.size(), to_copy);
+                continue;
+            }
+            else
+            {
+                kodi::Log(ADDON_LOG_WARNING, "FastVFS: 小文件 DownloadRange 失败, 回退到 Worker 模式");
+            }
+        }
+
+        // ---------------------------------------------------------
+        // 3. LRU 未命中 - 从 RingBuffer 获取数据填充 LRU
         // ---------------------------------------------------------
 
         // 延迟启动 Worker
@@ -2005,6 +2073,178 @@ int64_t CCurlBuffer::Seek(int64_t position, int whence)
 
     // Lazy Seek: 这里不做任何网络操作，全部推迟到 Read() 中处理。
     return m_logical_position;
+}
+
+// -----------------------------------------------------------------------------------------
+// 写入接口 (Write Interface)
+// -----------------------------------------------------------------------------------------
+// 参考 Kodi 原生 CurlFile 的 multi-interface 模式:
+// - OpenForWrite: 设置 CURLOPT_UPLOAD, 使用 curl_multi 驱动
+// - Write: 通过 READFUNCTION 回调向服务器传递数据
+// - UploadReadCallback: curl 拉取数据的回调，数据发完后 PAUSE
+// -----------------------------------------------------------------------------------------
+
+size_t CCurlBuffer::UploadReadCallback(char *buffer, size_t size, size_t nitems, void *userp)
+{
+    CCurlBuffer *self = (CCurlBuffer *)userp;
+    if (!self)
+        return 0;
+
+    // EOF signal: Close() sets m_write_buffer_size = 0 to indicate upload is done
+    if (self->m_write_eof)
+        return 0;
+
+    if (self->m_write_buffer_pos >= self->m_write_buffer_size)
+    {
+        // 当前 Write() 的数据已全部发送，暂停传输等待下一次 Write()
+        self->m_write_paused = true;
+        return CURL_READFUNC_PAUSE;
+    }
+
+    size_t max_copy = size * nitems;
+    size_t remaining = self->m_write_buffer_size - self->m_write_buffer_pos;
+    size_t to_copy = std::min(max_copy, remaining);
+
+    memcpy(buffer, self->m_write_buffer + self->m_write_buffer_pos, to_copy);
+    self->m_write_buffer_pos += to_copy;
+
+    return to_copy;
+}
+
+bool CCurlBuffer::OpenForWrite(const kodi::addon::VFSUrl &url, bool overWrite)
+{
+    m_file_url = url.GetURL();
+    kodi::Log(ADDON_LOG_INFO, "FastVFS: OpenForWrite() URL=%s, OverWrite=%d", m_file_url.c_str(), overWrite);
+
+    // URL 清理: 去掉 Kodi 的 '|' 参数
+    size_t pipe_pos = m_file_url.find('|');
+    if (pipe_pos != std::string::npos)
+        m_file_url = m_file_url.substr(0, pipe_pos);
+
+    m_username = url.GetUsername();
+    m_password = url.GetPassword();
+
+    // 检查文件是否已存在 (不覆写时拒绝)
+    if (!overWrite)
+    {
+        CCurlBuffer probe;
+        probe.m_net_connect_timeout_sec = m_net_connect_timeout_sec;
+        probe.m_net_read_timeout_sec = m_net_read_timeout_sec;
+        if (probe.Stat(url))
+        {
+            kodi::Log(ADDON_LOG_WARNING, "FastVFS: OpenForWrite 拒绝: 文件已存在且 overWrite=false");
+            return false;
+        }
+    }
+
+    // 初始化 curl multi 接口 (Kodi CurlFile 同样使用 multi 驱动上传)
+    m_write_curl = curl_easy_init();
+    if (!m_write_curl)
+    {
+        kodi::Log(ADDON_LOG_ERROR, "FastVFS: OpenForWrite curl_easy_init 失败");
+        return false;
+    }
+
+    m_write_multi = curl_multi_init();
+    if (!m_write_multi)
+    {
+        curl_easy_cleanup(m_write_curl);
+        m_write_curl = nullptr;
+        kodi::Log(ADDON_LOG_ERROR, "FastVFS: OpenForWrite curl_multi_init 失败");
+        return false;
+    }
+
+    // 配置通用选项 (URL, auth, SSL, redirect, timeout 等)
+    // 协议修复: dav:// -> http://, davs:// -> https:// (仅用于 curl 请求)
+    SetupBaseCurlOptions(m_write_curl, FixDavProtocol(m_file_url));
+
+    // 关键: 启用上传模式 (PUT)
+    curl_easy_setopt(m_write_curl, CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(m_write_curl, CURLOPT_READFUNCTION, UploadReadCallback);
+    curl_easy_setopt(m_write_curl, CURLOPT_READDATA, this);
+
+    // 将 easy handle 加入 multi
+    curl_multi_add_handle(m_write_multi, m_write_curl);
+
+    // 初始化写入状态
+    m_for_write = true;
+    m_write_error = false;
+    m_logical_position = 0;
+    m_write_buffer = nullptr;
+    m_write_buffer_size = 0;
+    m_write_buffer_pos = 0;
+    m_write_paused = false;
+
+    kodi::Log(ADDON_LOG_INFO, "FastVFS: OpenForWrite 成功. URL=%s", m_file_url.c_str());
+    return true;
+}
+
+ssize_t CCurlBuffer::Write(const uint8_t *buffer, size_t size)
+{
+    if (!(m_for_write && m_write_multi && m_write_curl) || m_write_error)
+        return -1;
+
+    // 设置本次 Write 的数据源
+    m_write_buffer = buffer;
+    m_write_buffer_size = size;
+    m_write_buffer_pos = 0;
+    m_write_paused = false;
+
+    // 恢复传输 (UploadReadCallback 暂停后，需要恢复才能继续)
+    curl_easy_pause(m_write_curl, CURLPAUSE_CONT);
+
+    CURLMcode result = CURLM_OK;
+    m_write_still_running = 1;
+
+    // 驱动 multi-interface 直到本次数据全部发送或传输被暂停
+    while (m_write_still_running && !m_write_paused)
+    {
+        result = curl_multi_perform(m_write_multi, &m_write_still_running);
+
+        if (!m_write_still_running)
+            break;
+
+        if (result != CURLM_OK)
+        {
+            long code = 0;
+            curl_easy_getinfo(m_write_curl, CURLINFO_RESPONSE_CODE, &code);
+            kodi::Log(ADDON_LOG_ERROR, "FastVFS: Write 失败. HTTP=%ld, Multi Error=%d", code, result);
+            m_write_error = true;
+            return -1;
+        }
+
+        // Wait for socket activity to avoid busy-spin
+        if (!m_write_paused)
+            curl_multi_poll(m_write_multi, NULL, 0, 1000, NULL);
+    }
+
+    // Check if transfer completed prematurely (server error etc.)
+    if (!m_write_still_running && m_write_buffer_pos < m_write_buffer_size)
+    {
+        CURLMsg *msg;
+        int msgs_left;
+        while ((msg = curl_multi_info_read(m_write_multi, &msgs_left)))
+        {
+            if (msg->msg == CURLMSG_DONE && msg->data.result != CURLE_OK)
+            {
+                long code = 0;
+                curl_easy_getinfo(m_write_curl, CURLINFO_RESPONSE_CODE, &code);
+                kodi::Log(ADDON_LOG_ERROR, "FastVFS: Write transfer ended prematurely. HTTP=%ld, CurlCode=%d", code, msg->data.result);
+                m_write_error = true;
+                return -1;
+            }
+        }
+    }
+
+    ssize_t written = (ssize_t)m_write_buffer_pos;
+    m_logical_position += written;
+    return written;
+}
+
+int CCurlBuffer::Truncate(int64_t size)
+{
+    // HTTP/WebDAV 不支持 Truncate, 与 Kodi CurlFile 行为一致
+    return -1;
 }
 
 
