@@ -44,6 +44,11 @@ public:
     // Helper for callback
     bool IsTransferAborted() const { return m_abort_transfer; }
 
+    // ISO 延迟关闭支持
+    bool IsIsoFile() const { return m_is_iso; }
+    const std::string& GetOriginalUrl() const { return m_original_kodi_url; }
+    void ResetForReuse(); // 延迟关闭复用时重置逻辑状态
+
     // 状态控制 (Public allow callback access)
     std::atomic<bool> m_is_running = false;
 
@@ -81,7 +86,8 @@ protected:
     // 状态变量
     bool m_support_range = false;
     bool m_is_directory = false;
-    bool m_is_video = false; 
+    bool m_is_video = false;
+    bool m_is_iso = false;
     time_t m_mod_time = 0;
     time_t m_access_time = 0;
 
@@ -110,6 +116,7 @@ protected:
 private:
     // 基础信息
     std::string m_file_url;
+    std::string m_original_kodi_url; // 原始 Kodi URL (延迟关闭缓存 key)
     std::string m_username;
     std::string m_password;
 

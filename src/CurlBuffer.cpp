@@ -541,6 +541,17 @@ void CCurlBuffer::Close()
 }
 
 // -----------------------------------------------------------------------------------------
+// ResetForReuse: 延迟关闭复用时重置逻辑状态 (Worker 线程保持运行)
+// -----------------------------------------------------------------------------------------
+void CCurlBuffer::ResetForReuse()
+{
+    m_logical_position = 0;
+    // Worker 线程、RingBuffer、下载状态全部保留原样
+    // Read() 如需新位置数据会通过 m_trigger_reset 通知 Worker 跳转
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ResetForReuse() -> 逻辑位置归零, Worker 保持运行");
+}
+
+// -----------------------------------------------------------------------------------------
 // Helper: Detect Double Encoding
 // -----------------------------------------------------------------------------------------
 static bool IsLikelyDoubleEncoded(const std::string& url)
@@ -592,6 +603,7 @@ static void FixDoubleEncoding(std::string& url)
 bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
 {
     m_file_url = url.GetURL();
+    m_original_kodi_url = m_file_url; // 保存原始 URL 用于延迟关闭缓存 key
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 调用 Stat(), URL=%s", m_file_url.c_str());
 
     // 每次 Stat 都重置这些由探测结果驱动的状态，避免沿用上一次实例状态
@@ -630,6 +642,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                   ext == "ts" || ext == "bdmv" || ext == "ifo" || ext == "3gp" ||
                   ext == "rmvb" || ext =="rm" || ext == "vob" || ext == "mpg" || 
                   ext == "mpeg" );
+    m_is_iso = (ext == "iso");
 
     // ---------------------------------------------------------
     // 0. 检查全局 Stat 缓存

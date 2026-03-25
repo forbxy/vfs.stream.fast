@@ -12,7 +12,7 @@ class CClientVFS : public kodi::addon::CInstanceVFS
 {
 public:
   CClientVFS(const kodi::addon::IInstanceInfo& instance);
-  ~CClientVFS() override = default;
+  ~CClientVFS() override;
 
   // --- 核心 IO 接口 ---
   kodi::addon::VFSFileHandle Open(const kodi::addon::VFSUrl& url) override;
