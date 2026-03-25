@@ -179,12 +179,6 @@ kodi::addon::VFSFileHandle CClientVFS::Open(const kodi::addon::VFSUrl &url)
     size_t lru_total_size = (size_t)MyGetSettingInt("lru_total_size", 100) * 1024 * 1024;
     CCurlBuffer::UpdateLRUSettings(lru_block_size, lru_total_size);
 
-    // [New] 读取跳转缓存 TTL (默认 4 小时)
-    int ttl_hours = MyGetSettingInt("redirect_cache_ttl", 4);
-    if (ttl_hours > 0) {
-        file->m_cfg_redirect_cache_ttl_sec = ttl_hours * 3600;
-    }
-
     // [New] Fail Fast (Quick Timeout Reconnect)
     bool fail_fast = false;
     if (kodi::addon::CPrivateBase::m_interface && kodi::addon::CPrivateBase::m_interface->toKodi && kodi::addon::CPrivateBase::m_interface->toKodi->kodi_addon) {

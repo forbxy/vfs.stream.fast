@@ -19,16 +19,7 @@
                     <default>false</default>
                     <control type="toggle" />
                 </setting>
-                <setting id="redirect_cache_ttl" type="integer" label="30010">
-                    <level>0</level>
-                    <default>4</default>
-                    <constraints>
-                        <minimum>0</minimum>
-                        <maximum>24</maximum>
-                        <step>1</step>
-                    </constraints>
-                    <control type="slider" format="integer" />
-                </setting>                <setting id="lru_block_size" type="integer" label="30011">
+                <setting id="lru_block_size" type="integer" label="30011">
                     <level>0</level>
                     <default>2</default>
                     <constraints>

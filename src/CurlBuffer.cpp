@@ -120,40 +120,7 @@ void CCurlBuffer::UpdateLRUSettings(size_t block_size, size_t total_size)
 }
 
 // -----------------------------------------------------------------------------------------
-// 全局 Stat 缓存 (Metadata Cache)
-// -----------------------------------------------------------------------------------------
-struct StatCacheEntry
-{
-    int64_t size = -1;
-    bool exists = false;
-    bool support_range = true; // 默认假设支持，除非被动发现不支持
-    time_t mod_time = 0;
-    time_t access_time = 0;
-    bool is_dir = false;
-    time_t cached_at = 0; // 缓存写入时间
-
-    static constexpr int TTL_SEC = 60; // 缓存有效期 1 分钟
-    bool IsExpired() const { return (time(nullptr) - cached_at) > TTL_SEC; }
-};
-
-// Key: URL (normalized), Value: StatCacheEntry
-static std::map<std::string, StatCacheEntry> g_stat_cache;
-static std::mutex g_stat_cache_mutex;
-
-// -----------------------------------------------------------------------------------------
-// 全局 Redirect 缓存 (302 Cache)
-// -----------------------------------------------------------------------------------------
-// 缓存 302 跳转后的有效 URL，下次直接访问目标地址
-// [Fix] 增加时间戳以支持过期 (1小时)
-struct RedirectCacheEntry
-{
-    std::string target_url;
-    time_t timestamp;
-};
-
-// Key: Original URL, Value: RedirectCacheEntry
-static std::map<std::string, RedirectCacheEntry> g_redirect_cache;
-static std::mutex g_redirect_cache_mutex;
+// (Stat 缓存和 Redirect 缓存已移除，跳转地址改为实例变量 m_effective_url)
 // -----------------------------------------------------------------------------------------
 
 
@@ -308,52 +275,12 @@ static void ReturnCurlHandleToPool(CURL* handle)
     }
 }
 
-// [Fix] 增加 TTL 参数
-static std::string ResolveRedirectUrl(const std::string& input_url, long ttl = 14400)
-{
-    std::string current = input_url;
-    std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
-    time_t now = time(NULL);
 
-    for(int i=0; i<10; i++)
-    {
-        auto it = g_redirect_cache.find(current);
-        if (it != g_redirect_cache.end())
-        {
-            // [Fix] 检查有效期 (默认 4小时)
-            if (now - it->second.timestamp < ttl)
-            {
-                if (it->second.target_url != current)
-                {
-                    current = it->second.target_url;
-                }
-                else
-                {
-                    break;
-                }
-            }
-            else
-            {
-                // 已过期，删除记录并停止递归解析，回退到当前的 URL (即过期的上级)
-                // 这样下次 Curl 请求就会使用这个 URL，重新触发重定向逻辑并更新缓存
-                // FIXME 可能会有多层下级过期的被保留，但影响不大
-                g_redirect_cache.erase(it);
-                break;
-            }
-        }
-        else
-        {
-            break;
-        }
-    }
-    return current;
-}
 
 // -----------------------------------------------------------------------------------------
-// Helper: Update Redirect Cache from CURL effective URL
+// Helper: 从 CURL 有效 URL 更新实例的 m_effective_url
 // -----------------------------------------------------------------------------------------
-// [Fix] 增加 self 指针以更新 m_total_size 等
-void CCurlBuffer::UpdateRedirectCacheFromCurl(CURL* curl, const std::string& original_url, const char* context_name, CCurlBuffer* self)
+void CCurlBuffer::UpdateEffectiveUrlFromCurl(CURL* curl, const std::string& original_url, const char* context_name)
 {
     char *eff_url = NULL;
     curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff_url);
@@ -362,86 +289,57 @@ void CCurlBuffer::UpdateRedirectCacheFromCurl(CURL* curl, const std::string& ori
         std::string effective_url_str(eff_url);
         
         // 只有当有效 URL 与请求的 URL 不同时才认为是跳转
-        // 且不只是协议的区别 (http vs https)
-        // 简单判断: 字符串不相等
         if (original_url != effective_url_str)
         {
-             // 1. 更新全局跳转缓存: A -> B
-             bool is_new_redirect = false;
+             if (m_effective_url != effective_url_str)
              {
-                 std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
-                 
-                 // [Fix] 检查是否已存在相同的跳转记录
-                 auto it = g_redirect_cache.find(original_url);
-                 if (it != g_redirect_cache.end() && it->second.target_url == effective_url_str)
-                 {
-                     return; 
-                 }
-                 else
-                 {
-                     // 不存在或目标改变，写入新记录
-                     RedirectCacheEntry entry;
-                     entry.target_url = effective_url_str;
-                     entry.timestamp = time(NULL);
-                     g_redirect_cache[original_url] = entry;
-                     is_new_redirect = true;
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: %s 检测到跳转: %s -> %s", context_name, original_url.c_str(), effective_url_str.c_str());
+                m_effective_url = effective_url_str;
+             }
+
+             // 如果发生了跳转，尝试从最终响应中获取正确的文件大小
+             int64_t new_size = 0;
+             struct curl_header *h = NULL;
+             
+             // 1. 尝试 Content-Range (Worker/DownloadRange 常用)
+             if (curl_easy_header(curl, "Content-Range", 0, CURLH_HEADER, -1, &h) == CURLHE_OK)
+             {
+                 if (h && h->value) {
+                     std::string cr(h->value);
+                     auto pos = cr.find('/');
+                     if (pos != std::string::npos) {
+                         std::string total_str = cr.substr(pos + 1);
+                         if (total_str != "*" && !total_str.empty()) {
+                             try { new_size = std::stoll(total_str); } catch(...) {}
+                         }
+                     }
                  }
              }
              
-             if (is_new_redirect)
+             // 2. 如果没找到 Range，且是 200 OK (非 Partial)，尝试 Content-Length
+             if (new_size <= 0)
              {
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: %s 检测到跳转: %s -> %s (Added to Cache)", context_name, original_url.c_str(), effective_url_str.c_str());
+                 long response_code = 0;
+                 curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+                 if (response_code == 200)
+                 {
+                     curl_off_t cl = -1;
+                     if (curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl) == CURLE_OK && cl > 0)
+                     {
+                         new_size = (int64_t)cl;
+                     }
+                     else
+                     {
+                         new_size = 0; 
+                     }
+                 }
              }
 
-             // [New] 如果发生了跳转，尝试从最终响应中获取正确的文件大小
-             if (self)
+             // 更新大小 (如果此时我们不知道大小，或者大小不一致)
+             if (new_size > 0 && (m_total_size == 0 || m_total_size != new_size))
              {
-                 int64_t new_size = 0;
-                 struct curl_header *h = NULL;
-                 
-                 // 1. 尝试 Content-Range (Worker/DownloadRange 常用)
-                 if (curl_easy_header(curl, "Content-Range", 0, CURLH_HEADER, -1, &h) == CURLHE_OK)
-                 {
-                     if (h && h->value) {
-                         std::string cr(h->value);
-                         auto pos = cr.find('/');
-                         if (pos != std::string::npos) {
-                             std::string total_str = cr.substr(pos + 1);
-                             if (total_str != "*" && !total_str.empty()) {
-                                 try { new_size = std::stoll(total_str); } catch(...) {}
-                             }
-                         }
-                     }
-                 }
-                 
-                 // 2. 如果没找到 Range，且是 200 OK (非 Partial)，尝试 Content-Length
-                 if (new_size <= 0)
-                 {
-                     long response_code = 0;
-                     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-                     if (response_code == 200)
-                     {
-                         curl_off_t cl = -1;
-                         if (curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl) == CURLE_OK && cl > 0)
-                         {
-                             new_size = (int64_t)cl;
-                         }
-                         // [Explicit] 如果确实拿不到长度 (例如 GZIP 且没 Content-Length)，显式设为 0
-                         // 这样后续逻辑就会禁用静态缓存并使用保守 RingBuffer
-                         else
-                         {
-                             new_size = 0; 
-                             // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Redirect 200 OK but no Content-Length found (likely GZIP/Chunked). Size=0");
-                         }
-                     }
-                 }
-
-                 // 更新大小 (如果此时我们不知道大小，或者大小不一致)
-                 if (new_size > 0 && (self->m_total_size == 0 || self->m_total_size != new_size))
-                 {
-                     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [%s] Redirect target provided new size: %lld (Old: %lld)", context_name, new_size, self->m_total_size);
-                     self->m_total_size = new_size;
-                 }
+                 kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [%s] Redirect target provided new size: %lld (Old: %lld)", context_name, new_size, m_total_size);
+                 m_total_size = new_size;
              }
         }
     }
@@ -644,40 +542,6 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                   ext == "mpeg" );
     m_is_iso = (ext == "iso");
 
-    // ---------------------------------------------------------
-    // 0. 检查全局 Stat 缓存
-    // ---------------------------------------------------------
-    {
-        std::lock_guard<std::mutex> lock(g_stat_cache_mutex);
-        auto it = g_stat_cache.find(m_file_url);
-        if (it != g_stat_cache.end())
-        {
-            const StatCacheEntry& entry = it->second;
-            if (entry.IsExpired())
-            {
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Cache EXPIRED: %s", m_file_url.c_str());
-                g_stat_cache.erase(it);
-            }
-            else if (!entry.exists)
-            {
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Cache HIT (Not Found): %s", m_file_url.c_str());
-                return false;
-            }
-            else
-            {
-                m_total_size = entry.size;
-                m_support_range = entry.support_range;
-                m_mod_time = entry.mod_time;
-                m_access_time = entry.access_time;
-                m_is_directory = entry.is_dir;
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Cache HIT (Size: %lld): %s", m_total_size, m_file_url.c_str());
-                return true;
-            }
-        }
-    }
-
-    // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件属性 (Stat) URL: %s", m_file_url.c_str());
-
     // 初始化通用变量
     bool success = false;
     int64_t final_size = 0;
@@ -690,10 +554,8 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     // 重置 Handle
     curl_easy_reset(curl);
     
-    std::string target_url = m_file_url;
-    if (m_is_video) {
-        target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
-    }
+    // 使用 m_effective_url（如有之前缓存的跳转地址）
+    std::string target_url = !m_effective_url.empty() ? m_effective_url : m_file_url;
 
     // Determine WebDAV flag based on actual request target (after redirect resolution)
     bool isWebDav = (target_url.rfind("dav://", 0) == 0) || (target_url.rfind("davs://", 0) == 0);
@@ -741,8 +603,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         if (res != CURLE_OK)
         {
             kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat %s Error %d. Detail: %s", isWebDav ? "WebDAV" : "HTTP", res, errbuf);
-            std::lock_guard<std::mutex> l(g_redirect_cache_mutex);
-            g_redirect_cache.erase(m_file_url);
+            m_effective_url.clear();
         }
     }
 
@@ -1014,60 +875,39 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     
 
     // ---------------------------------------------------------
-    // Update Redirect Cache (如果发生了跳转)
+    // 更新实例跳转地址 (如果发生了跳转)
     // ---------------------------------------------------------
     if (res == CURLE_OK)
     {
-        UpdateRedirectCacheFromCurl(curl, m_file_url, "Stat", this);
+        UpdateEffectiveUrlFromCurl(curl, m_file_url, "Stat");
     }
 
     // ---------------------------------------------------------
-    // 3. 更新 Stat Cache (通用)
+    // 3. 处理 Stat 结果
     // ---------------------------------------------------------
+    if (response_code == 200 || response_code == 206)
     {
-        std::lock_guard<std::mutex> lock(g_stat_cache_mutex);
-        StatCacheEntry entry;
-
-        if (response_code == 200 || response_code == 206)
+        success = true;
+        m_total_size = final_size;
+        
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Success (%s). Size: %lld, Range: %d, Time: %lld, IsDir: %d", 
+            isWebDav ? "WebDAV" : "HTTP", final_size, m_support_range, (int64_t)m_mod_time, m_is_directory);
+    }
+    else
+    {
+        if (res == CURLE_OK && (response_code == 404 || response_code == 410))
         {
-            success = true;
-            m_total_size = final_size;
-            
-            entry.exists = true;
-            entry.size = final_size;
-            entry.mod_time = m_mod_time;
-            entry.access_time = 0; 
-            entry.support_range = m_support_range;
-            entry.is_dir = m_is_directory;
-            entry.cached_at = time(nullptr);
-            
-             kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Success (%s). Size: %lld, Range: %d, Time: %lld, IsDir: %d", 
-                 isWebDav ? "WebDAV" : "HTTP", final_size, m_support_range, (int64_t)m_mod_time, m_is_directory);
-             
-             // 成功结果总是已缓存
-             g_stat_cache[m_file_url] = entry;
+            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Failed (404/410). Code=%ld", response_code);
+        }
+        else if (res == CURLE_OK && (response_code >= 400 && response_code < 500))
+        {
+            kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat Failed. CurCode=%d, HTTP=%ld, URL=%s", res, response_code, m_file_url.c_str());
         }
         else
         {
-            // [Fix] 仅明确的 404/410 才缓存 "Not Found"
-            // 不要缓存网络超时(28)、连接拒绝(7)或服务器内部错误(5xx)，以便下次重试
-            if (res == CURLE_OK && (response_code == 404 || response_code == 410))
-            {
-               kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Failed (404/410). Code=%ld (Cached as Not Found)", response_code);
-               entry.exists = false;
-               entry.cached_at = time(nullptr);
-               g_stat_cache[m_file_url] = entry;
-            }
-            else if (res == CURLE_OK && (response_code >= 400 && response_code < 500))
-            {
-               kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat Failed. CurCode=%d, HTTP=%ld, URL=%s (Not Cached, allowing retry)", res, response_code, m_file_url.c_str());
-            }
-            else
-            {
-               kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat Error. CurCode=%d, HTTP=%ld, URL=%s (Not Cached, allowing retry)", res, response_code, m_file_url.c_str());
-            }
-            success = false;
+            kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat Error. CurCode=%d, HTTP=%ld, URL=%s", res, response_code, m_file_url.c_str());
         }
+        success = false;
     }
 
     ReturnCurlHandleToPool(curl);
@@ -1215,7 +1055,6 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
     while (retries < m_net_max_retries)
     {
         // 复用 SetupCurlOptions 的部分逻辑，但需要手动设置 WriteFunction
-        // 同样使用 ResolveRedirectUrl 确保预热请求也是最新的
         // [Retry] 每次重试前重置 handle 状态
         curl_easy_reset(curl);
         errbuf[0] = 0;
@@ -1223,11 +1062,7 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
         // 设置错误信息缓冲区
         curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
-        std::string target_url = m_file_url;
-        if (m_is_video)
-        {
-            target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
-        }
+        std::string target_url = !m_effective_url.empty() ? m_effective_url : m_file_url;
         target_url = FixDavProtocol(target_url);
     
         // Use new helper
@@ -1261,7 +1096,7 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
             // ---------------------------------------------------------
             // Update Redirect Cache (如果发生了跳转)
             // ---------------------------------------------------------
-            UpdateRedirectCacheFromCurl(curl, m_file_url, "DownloadRange", this); // will use this->m_total_size
+            UpdateEffectiveUrlFromCurl(curl, m_file_url, "DownloadRange");
 
             // 检查 HTTP Code
             if (response_code >= 200 && response_code < 300)
@@ -1286,11 +1121,8 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
               kodi::Log(ADDON_LOG_ERROR, "FastVFS: DownloadRange 失败. Code=%d, HTTP=%ld. Retry (%d/%d). Detail: %s", res, response_code, retries + 1, m_net_max_retries, errbuf);
         }
         
-        // [Fix] 无论是超时还是错误，都清除跳转缓存，确保重试时使用最新链接
-        {
-            std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
-            g_redirect_cache.erase(m_file_url);
-        }
+        // 清除跳转地址，确保重试时使用原始 URL 重新触发重定向
+        m_effective_url.clear();
 
         retries++;
         if (retries < m_net_max_retries)
@@ -1389,10 +1221,7 @@ void CCurlBuffer::WorkerThread()
         errbuf[0] = 0;
         curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
-        std::string target_url = m_file_url;
-        if (m_is_video) {
-            target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
-        }
+        std::string target_url = !m_effective_url.empty() ? m_effective_url : m_file_url;
         target_url = FixDavProtocol(target_url);
 
         SetupWorkerDownloadOptions(curl, target_url, m_download_position);
@@ -1414,7 +1243,7 @@ void CCurlBuffer::WorkerThread()
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp_code);
             if (resp_code > 0)
             {
-                UpdateRedirectCacheFromCurl(curl, m_file_url, "Worker", this);
+                UpdateEffectiveUrlFromCurl(curl, m_file_url, "Worker");
             }
         }
 
@@ -1492,13 +1321,8 @@ void CCurlBuffer::WorkerThread()
                 kodi::Log(ADDON_LOG_ERROR, "FastVFS: Curl 错误: %d. 重试 %d/%d", res, retries, m_net_max_retries);
             }
 
-            // [New] 发生错误时和超时时都清除 302 缓存，确保重试时使用原始 URL
-            // 这可以防止因为 CDN 链接过期 (403/410) 或 IP 变动导致的持续错误
-            // 下一次 SetupCurlOptions 会重新解析，libcurl 会自动处理跳转并触发 UpdateRedirectCacheFromCurl 更新缓存
-            {
-                std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
-                g_redirect_cache.erase(m_file_url);
-            }
+            // 发生错误时清除跳转地址，确保重试时使用原始 URL 重新触发重定向
+            m_effective_url.clear();
 
             // [优化] 如果连接断开但缓冲区数据充足，先消耗缓冲区，避免立即重连
             // 场景: 暂停很久 -> 服务器断连 -> Keepalive 发现报错 -> 此时 Buffer 可能是满的

@@ -62,9 +62,6 @@ public:
 
     size_t m_cfg_ring_size = 100 * 1024 * 1024;   // 主 RingBuffer 大小
 
-    // 跳转记录缓存时间 (秒)
-    long m_cfg_redirect_cache_ttl_sec = 14400;
-
     // -----------------------------------------------------------------------
     // Network Timeouts & Limits
     // -----------------------------------------------------------------------
@@ -107,7 +104,7 @@ protected:
     void SetupDownloadRangeOptions(CURL* curl, const std::string& target_url, int64_t start, int64_t length);
     void SetupWorkerDownloadOptions(CURL* curl, const std::string& target_url, int64_t start);
 
-    static void UpdateRedirectCacheFromCurl(CURL* curl, const std::string& original_url, const char* context_name, CCurlBuffer* self = nullptr);
+    void UpdateEffectiveUrlFromCurl(CURL* curl, const std::string& original_url, const char* context_name);
     static std::string GetFileExtensionFromUrl(const std::string& url); // [New] Get Extension Helper
 
     // 写入模式回调 (curl READFUNCTION, 向服务器上传数据)
@@ -116,6 +113,7 @@ protected:
 private:
     // 基础信息
     std::string m_file_url;
+    std::string m_effective_url; // 跳转后的最终地址 (实例级别)
     std::string m_original_kodi_url; // 原始 Kodi URL (延迟关闭缓存 key)
     std::string m_username;
     std::string m_password;

@@ -43,7 +43,7 @@ public:
   
   int GetChunkSize(kodi::addon::VFSFileHandle context) override {
     CCurlBuffer* buf = (CCurlBuffer*)context;
-    int chunk = (buf && buf->IsRangeSupported()) ? 64*1024 : 0;
+    int chunk = (buf && buf->IsRangeSupported()) ? 256*1024 : 0;
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: GetChunkSize() called, returning %d", chunk);
     return chunk;
   }
