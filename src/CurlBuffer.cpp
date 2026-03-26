@@ -181,16 +181,7 @@ static bool IsFatalError(CURLcode res)
     return false;
 }
 
-// -----------------------------------------------------------------------------------------
-// Helper: Get User Agent mimicking Kodi's native behavior
-// -----------------------------------------------------------------------------------------
 
-static std::string GetUserAgent()
-{
-    // Use Kodi's API to get the exact native User-Agent string
-    // This ensures we match 'Kodi/21.2 (Windows NT ...)' exactly
-    return kodi::network::GetUserAgent();
-}
 
 // [New] 获取文件扩展名函数 (使用 libcurl URL API 解析)
 std::string CCurlBuffer::GetFileExtensionFromUrl(const std::string& url)
@@ -346,6 +337,7 @@ void CCurlBuffer::UpdateEffectiveUrlFromCurl(CURL* curl, const std::string& orig
 }
 
 CCurlBuffer::CCurlBuffer()
+    : m_user_agent(kodi::network::GetUserAgent())
 {
 }
 
@@ -444,6 +436,7 @@ void CCurlBuffer::Close()
 void CCurlBuffer::ResetForReuse()
 {
     m_logical_position = 0;
+    // 注意: 不重置 m_is_first_read — 延迟关闭复用时已有缓存数据，无需快速首读
     // Worker 线程、RingBuffer、下载状态全部保留原样
     // Read() 如需新位置数据会通过 m_trigger_reset 通知 Worker 跳转
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ResetForReuse() -> 逻辑位置归零, Worker 保持运行");
@@ -1381,7 +1374,7 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, NULL);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, NULL);
     
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, GetUserAgent().c_str());
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, m_user_agent.c_str());
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
     curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 0L);
     curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
@@ -1416,8 +1409,8 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
     // curl_easy_setopt(curl, CURLOPT_UNRESTRICTED_AUTH, 1L);
 
     // SSL & Redirects
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    // SSL verification enabled by default (libcurl defaults: VERIFYPEER=1, VERIFYHOST=2)
+    // Consistent with Kodi's own CCurlFile behavior (m_verifyPeer = true)
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     // [Fix] Allow all redirect
@@ -1503,7 +1496,11 @@ void CCurlBuffer::SetupWorkerDownloadOptions(CURL* curl, const std::string& targ
 
     if (m_support_range)
     {
-        curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)start);
+        // 不用 CURLOPT_RESUME_FROM_LARGE: libcurl 把 RESUME_FROM_LARGE(0) 视为 no-op,
+        // 导致 start=0 时不发送 Range header, 服务器返回 200 全量而非 206.
+        // 改用 CURLOPT_RANGE 可以正确发送 "Range: bytes=0-" 等所有情况.
+        std::string range_str = std::to_string(start) + "-";
+        curl_easy_setopt(curl, CURLOPT_RANGE, range_str.c_str());
     }
     else
     {
@@ -1630,6 +1627,7 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
             continue;
         }
 
+
         int64_t current_pos = m_logical_position;
 
         // EOF 检查
@@ -1699,14 +1697,68 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
             }
         }
 
+
         // ---------------------------------------------------------
         // 3. LRU 未命中 - 从 RingBuffer 获取数据填充 LRU
         // ---------------------------------------------------------
 
-        // 延迟启动 Worker
+        // 延迟启动 Worker (从 block 对齐位置, 确保完整下载当前 LRU 块)
         if (!m_worker_thread.joinable())
         {
+            int64_t aligned_pos = (m_logical_position / LRU_BLOCK_SIZE) * LRU_BLOCK_SIZE;
+            int64_t saved_pos = m_logical_position;
+            m_logical_position = aligned_pos;
             StartWorker();
+            m_logical_position = saved_pos;
+        }
+
+        // ---------------------------------------------------------
+        // ISO 首读优化: 预取文件尾块 (libbluray 需要读 UDF 文件系统表)
+        // ---------------------------------------------------------
+        // Worker 刚启动正在下载头部, 这里趁机用 DownloadRange 下载尾块。
+        // 先查 LRU, miss 才下载。两个下载并行执行, 省去后续瞬移耗时。
+        if (m_is_first_read && m_is_iso && m_support_range && m_total_size > (int64_t)LRU_BLOCK_SIZE)
+        {
+            m_is_first_read = false;
+
+            int64_t last_block_num = (m_total_size - 1) / (int64_t)LRU_BLOCK_SIZE;
+            if (last_block_num != block_num) // 尾块 != 当前块
+            {
+                std::shared_ptr<std::vector<uint8_t>> tail_cached;
+                {
+                    std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                    tail_cached = g_lru_cache.Get(m_file_url, last_block_num);
+                }
+                if (!tail_cached)
+                {
+                    int64_t last_block_start = last_block_num * (int64_t)LRU_BLOCK_SIZE;
+                    int64_t last_block_size = m_total_size - last_block_start;
+
+                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ★ ISO 首读预取尾块: Block#%lld (pos %lld, size %lld)",
+                        last_block_num, last_block_start, last_block_size);
+
+                    std::vector<uint8_t> tail_data((size_t)last_block_size);
+                    CURL* dl_curl = GetCurlHandleFromPool();
+                    bool ok = DownloadRange(dl_curl, last_block_start, last_block_size, tail_data);
+                    ReturnCurlHandleToPool(dl_curl);
+
+                    if (ok && !tail_data.empty())
+                    {
+                        std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                        g_lru_cache.Put(m_file_url, last_block_num, tail_data.data(), tail_data.size());
+                        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ★ ISO 尾块预取成功, 写入 LRU Block#%lld (%zu bytes)",
+                            last_block_num, tail_data.size());
+                    }
+                    else
+                    {
+                        kodi::Log(ADDON_LOG_WARNING, "FastVFS: ISO 尾块预取失败, 将在后续按需下载");
+                    }
+                }
+            }
+        }
+        else
+        {
+            m_is_first_read = false;
         }
 
         // 计算目标块的绝对范围

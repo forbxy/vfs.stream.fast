@@ -85,6 +85,7 @@ protected:
     bool m_is_directory = false;
     bool m_is_video = false;
     bool m_is_iso = false;
+    bool m_is_first_read = true; // 快速首次读取标志 (ISO 优化)
     time_t m_mod_time = 0;
     time_t m_access_time = 0;
 
@@ -117,6 +118,7 @@ private:
     std::string m_original_kodi_url; // 原始 Kodi URL (延迟关闭缓存 key)
     std::string m_username;
     std::string m_password;
+    std::string m_user_agent; // Cached at construction, never changes
 
     int64_t m_total_size = 0;                     // 文件总大小
     int64_t m_logical_position = 0;               // Kodi 认为的播放位置
