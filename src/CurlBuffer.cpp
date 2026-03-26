@@ -2,6 +2,10 @@
 #include <algorithm>
 #include <string>
 #include <cctype>
+#include <cstdlib>
+#ifdef _WIN32
+#include <Windows.h>
+#endif
 #include <kodi/addon-instance/VFS.h> // for logging
 #include <kodi/General.h>
 #include <kodi/Network.h>
@@ -1411,6 +1415,57 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
     // SSL & Redirects
     // SSL verification enabled by default (libcurl defaults: VERIFYPEER=1, VERIFYHOST=2)
     // Consistent with Kodi's own CCurlFile behavior (m_verifyPeer = true)
+    //
+    // CA Certificate Bundle: Kodi sets the SSL_CERT_FILE environment variable at startup
+    // (PlatformAndroid.cpp, WinSystemWin32.cpp, PlatformDarwin.cpp, etc.)
+    // We read it here and set CURLOPT_CAINFO so libcurl can verify SSL certificates
+    // on platforms where no default CA bundle is available (e.g. Android with OpenSSL backend).
+    //
+    // Reading method matches Kodi's CEnvironment::getenv (platform/win32/Environment.cpp):
+    // 1. Try CRT getenv first
+    // 2. On Windows, fallback to Win32 API GetEnvironmentVariable (process-level env block,
+    //    shared across all DLLs regardless of CRT instance)
+    {
+        static std::string s_ca_cert_file;
+        static bool s_ca_cert_resolved = false;
+        if (!s_ca_cert_resolved)
+        {
+            s_ca_cert_resolved = true;
+            // Step 1: Try standard CRT getenv
+            const char* env_cert = std::getenv("SSL_CERT_FILE");
+            if (env_cert && env_cert[0] != '\0')
+            {
+                s_ca_cert_file = env_cert;
+            }
+#ifdef _WIN32
+            // Step 2: Fallback to Win32 API (matches Kodi's CEnvironment::win_getenv)
+            // Kodi uses SetEnvironmentVariableW + _wputenv to set env vars,
+            // but our DLL may have a separate CRT instance, so CRT getenv may not see it.
+            if (s_ca_cert_file.empty())
+            {
+                DWORD size = GetEnvironmentVariableA("SSL_CERT_FILE", nullptr, 0);
+                if (size > 0)
+                {
+                    std::string buf(size, '\0');
+                    if (GetEnvironmentVariableA("SSL_CERT_FILE", &buf[0], size) == size - 1)
+                    {
+                        buf.resize(size - 1); // remove trailing null
+                        s_ca_cert_file = buf;
+                    }
+                }
+            }
+#endif
+            if (!s_ca_cert_file.empty())
+            {
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Using CA bundle from SSL_CERT_FILE: %s", s_ca_cert_file.c_str());
+            }
+        }
+        if (!s_ca_cert_file.empty())
+        {
+            curl_easy_setopt(curl, CURLOPT_CAINFO, s_ca_cert_file.c_str());
+        }
+    }
+
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     // [Fix] Allow all redirect
