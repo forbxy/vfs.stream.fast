@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <sstream>
 #include <memory>
+#include "tinyxml2.h"
 
 size_t CCurlBuffer::LRU_BLOCK_SIZE = 1 * 1024 * 1024;
 size_t CCurlBuffer::LRU_TOTAL_SIZE = 100 * 1024 * 1024;
@@ -1370,6 +1371,83 @@ void CCurlBuffer::WorkerThread()
     ReturnCurlHandleToPool(curl);
 }
 
+// -----------------------------------------------------------------------------------------
+// LoadKodiProxySettings: 从 guisettings.xml 中解析 Kodi 全局代理设置
+// -----------------------------------------------------------------------------------------
+void CCurlBuffer::LoadKodiProxySettings()
+{
+    // guisettings.xml 路径 (special://userdata 在 Kodi 内部用 kodi::vfs::TranslateSpecialProtocol 解析)
+    std::string guisettings_path = kodi::vfs::TranslateSpecialProtocol("special://userdata/guisettings.xml");
+    if (guisettings_path.empty())
+    {
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: LoadKodiProxySettings - 无法解析 guisettings.xml 路径");
+        return;
+    }
+
+    tinyxml2::XMLDocument doc;
+    if (doc.LoadFile(guisettings_path.c_str()) != tinyxml2::XML_SUCCESS)
+    {
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: LoadKodiProxySettings - 无法加载 guisettings.xml: %s", guisettings_path.c_str());
+        return;
+    }
+
+    tinyxml2::XMLElement* root = doc.FirstChildElement("settings");
+    if (!root)
+    {
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: LoadKodiProxySettings - guisettings.xml 根节点不是 <settings>");
+        return;
+    }
+
+    bool use_proxy = false;
+    int proxy_type = 0;
+    std::string proxy_server;
+    int proxy_port = 0;
+    std::string proxy_user;
+    std::string proxy_pass;
+
+    for (tinyxml2::XMLElement* setting = root->FirstChildElement("setting");
+         setting != nullptr;
+         setting = setting->NextSiblingElement("setting"))
+    {
+        const char* id = setting->Attribute("id");
+        if (!id) continue;
+        const char* text = setting->GetText();
+        if (!text) continue;
+
+        std::string sid(id);
+        if (sid == "network.usehttpproxy")
+            use_proxy = (std::string(text) == "true");
+        else if (sid == "network.httpproxytype")
+            proxy_type = atoi(text);
+        else if (sid == "network.httpproxyserver")
+            proxy_server = text;
+        else if (sid == "network.httpproxyport")
+            proxy_port = atoi(text);
+        else if (sid == "network.httpproxyusername")
+            proxy_user = text;
+        else if (sid == "network.httpproxypassword")
+            proxy_pass = text;
+    }
+
+    if (!use_proxy || proxy_server.empty())
+    {
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: LoadKodiProxySettings - Kodi 代理未启用或服务器地址为空，跳过");
+        m_use_kodi_proxy = false;
+        return;
+    }
+
+    m_proxy_type = proxy_type;
+    m_proxy_server = proxy_server;
+    m_proxy_port = proxy_port;
+    m_proxy_username = proxy_user;
+    m_proxy_password = proxy_pass;
+
+    kodi::Log(ADDON_LOG_INFO,
+        "FastVFS: LoadKodiProxySettings - 已加载代理: type=%d, %s:%d, user=%s",
+        proxy_type, proxy_server.c_str(), proxy_port,
+        proxy_user.empty() ? "(none)" : proxy_user.c_str());
+}
+
 void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url)
 {
     // Common settings
@@ -1487,6 +1565,39 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
 
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, m_net_low_speed_time_sec);
+
+    // -----------------------------------------------------------------------
+    // Kodi Proxy Settings
+    // -----------------------------------------------------------------------
+    if (m_use_kodi_proxy && !m_proxy_server.empty())
+    {
+        // Map Kodi proxy type index to CURL proxy type constant
+        // Kodi settings.xml 选项顺序: 0=HTTP, 1=SOCKS4, 2=SOCKS4A, 3=SOCKS5, 4=SOCKS5H(hostname)
+        curl_proxytype curl_ptype = CURLPROXY_HTTP;
+        switch (m_proxy_type)
+        {
+            case 0: curl_ptype = CURLPROXY_HTTP;           break;
+            case 1: curl_ptype = CURLPROXY_SOCKS4;         break;
+            case 2: curl_ptype = CURLPROXY_SOCKS4A;        break;
+            case 3: curl_ptype = CURLPROXY_SOCKS5;         break;
+            case 4: curl_ptype = CURLPROXY_SOCKS5_HOSTNAME;break;
+            default: curl_ptype = CURLPROXY_HTTP;          break;
+        }
+        curl_easy_setopt(curl, CURLOPT_PROXYTYPE, (long)curl_ptype);
+        curl_easy_setopt(curl, CURLOPT_PROXY, m_proxy_server.c_str());
+        curl_easy_setopt(curl, CURLOPT_PROXYPORT, (long)m_proxy_port);
+
+        if (!m_proxy_username.empty())
+        {
+            std::string userpwd = m_proxy_username + ":" + m_proxy_password;
+            curl_easy_setopt(curl, CURLOPT_PROXYUSERPWD, userpwd.c_str());
+        }
+    }
+    else
+    {
+        // 明确清除代理，避免连接池中旧 handle 残留代理设置
+        curl_easy_setopt(curl, CURLOPT_PROXY, "");
+    }
 }
 
 void CCurlBuffer::SetupStatWebDavOptions(CURL* curl, const std::string& target_url, struct curl_slist** headers_out)

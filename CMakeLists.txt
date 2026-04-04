@@ -65,6 +65,8 @@ set(SOURCE_FILES
     src/client.h
     src/CurlBuffer.cpp
     src/CurlBuffer.h
+    src/tinyxml2.cpp
+    src/tinyxml2.h
 )
 
 # -----------------------------------------------------------------------------

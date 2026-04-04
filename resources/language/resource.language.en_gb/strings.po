@@ -24,3 +24,7 @@ msgstr "LRU Block Size (MB)"
 msgctxt "#30012"
 msgid "LRU Total Cache Size (MB)"
 msgstr "LRU Total Cache Size (MB)"
+
+msgctxt "#30013"
+msgid "Use Kodi Proxy Settings"
+msgstr "Use Kodi Proxy Settings"

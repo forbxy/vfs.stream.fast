@@ -75,6 +75,20 @@ public:
     
     int m_net_max_retries = 5;
 
+    // -----------------------------------------------------------------------
+    // Proxy Settings (loaded from guisettings.xml when use_kodi_proxy=true)
+    // -----------------------------------------------------------------------
+    bool m_use_kodi_proxy = false;
+    int m_proxy_type = 0;           // maps to CURLproxytype
+    std::string m_proxy_server;
+    int m_proxy_port = 0;
+    std::string m_proxy_username;
+    std::string m_proxy_password;
+
+    // Read Kodi's guisettings.xml and populate the proxy fields above.
+    // Should be called once after m_use_kodi_proxy is set to true.
+    void LoadKodiProxySettings();
+
 protected:
     // 工作线程入口
     void WorkerThread();
