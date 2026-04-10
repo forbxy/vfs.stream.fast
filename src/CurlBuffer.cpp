@@ -753,10 +753,27 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         
         // 对 .bdmv, .IFO, .BDM 等蓝光结构及图片文件，不做 fallback
         // 这些通常确实是小文件 且大多是kodi在频繁的扫文件夹，如果使用get，会穿透webdav缓存，直接访问源服务器，导致账号被风控
-        // FIXME 对于404的fallback是兼容emby-next-gen的无奈之举，需更加严谨的调查改进
         std::string check_ext = GetFileExtensionFromUrl(m_file_url); 
         bool is_sensitive_file = (check_ext == "bdmv" || check_ext == "ifo" || check_ext == "bdm" || 
                                 check_ext == "jpg" || check_ext == "png" || check_ext == "tbn");
+
+        // 检测 Emby-Next-Gen 图片占位响应 (Server: Emby-Next-Gen + Content-Type: image/unknown)
+        // next-gen 的 HEAD 对图片返回 Content-Length: 0 的占位响应，不能 fallback GET，
+        // 否则 GET 会消费掉一次性的 delayed_content，导致后续 Worker 下载时收到 404
+        bool is_emby_nextgen_picture_placeholder = false;
+        if (curl_easy_header(curl, "Server", 0, CURLH_HEADER, -1, &h) == CURLHE_OK && h && h->value)
+        {
+            std::string server_val(h->value);
+            if (server_val.find("Emby-Next-Gen") != std::string::npos && ct)
+            {
+                std::string ct_lower(ct);
+                std::transform(ct_lower.begin(), ct_lower.end(), ct_lower.begin(), ::tolower);
+                if (ct_lower.find("image/unknown") != std::string::npos)
+                {
+                    is_emby_nextgen_picture_placeholder = true;
+                }
+            }
+        }
 
         if (res == CURLE_OK)
         {
@@ -782,7 +799,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                 }
             }
             
-             if (!is_sensitive_file)
+             if (!is_sensitive_file && !is_emby_nextgen_picture_placeholder)
              {
                 // 一些服务器不支持 HEAD 请求，返回 4xx 错误码
                 if (response_code >= 400 && response_code < 500)
