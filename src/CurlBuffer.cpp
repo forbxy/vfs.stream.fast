@@ -5,6 +5,14 @@
 #include <cstdlib>
 #ifdef _WIN32
 #include <Windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#else
+#include <unistd.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #endif
 #include <kodi/addon-instance/VFS.h> // for logging
 #include <kodi/General.h>
@@ -1040,6 +1048,134 @@ static std::string ExtractHost(const std::string& url)
     return url.substr(start, end - start);
 }
 
+// Strip port from host:port string, e.g. "192.168.1.1:5244" -> "192.168.1.1"
+static std::string ExtractHostnameOnly(const std::string& host_and_port)
+{
+    // Handle IPv6 literal: [::1]:port
+    if (!host_and_port.empty() && host_and_port[0] == '[')
+    {
+        size_t bracket = host_and_port.find(']');
+        if (bracket != std::string::npos)
+            return host_and_port.substr(1, bracket - 1);
+    }
+    size_t colon = host_and_port.rfind(':');
+    if (colon == std::string::npos) return host_and_port;
+    return host_and_port.substr(0, colon);
+}
+
+// Helper: case-insensitive string compare
+static bool EqualsNoCase(const std::string& a, const std::string& b)
+{
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i])))
+            return false;
+    }
+    return true;
+}
+
+// Check if the hostname is a loopback/localhost address or matches a local interface.
+// Mirrors Kodi's CNetworkBase::IsLocalHost (xbmc/network/Network.cpp)
+static bool IsLocalHost(const std::string& hostname)
+{
+    if (hostname.empty())
+        return false;
+
+    // 127.0.0.0/8 loopback range
+    if (hostname.rfind("127.", 0) == 0)
+        return true;
+
+    // IPv6 loopback
+    if (hostname == "::1")
+        return true;
+
+    // "localhost" (case-insensitive)
+    if (EqualsNoCase(hostname, "localhost"))
+        return true;
+
+    // Check local machine hostname
+    {
+        char buf[256] = {};
+        if (gethostname(buf, sizeof(buf)) == 0)
+        {
+            buf[sizeof(buf) - 1] = '\0';
+            if (EqualsNoCase(hostname, std::string(buf)))
+                return true;
+        }
+    }
+
+    // Check local network interface IPs
+#ifdef _WIN32
+    {
+        ULONG bufSize = 15000;
+        PIP_ADAPTER_ADDRESSES addresses = nullptr;
+        ULONG ret = ERROR_BUFFER_OVERFLOW;
+        for (int tries = 0; tries < 3 && ret == ERROR_BUFFER_OVERFLOW; ++tries)
+        {
+            addresses = (PIP_ADAPTER_ADDRESSES)malloc(bufSize);
+            if (!addresses) break;
+            ret = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                       nullptr, addresses, &bufSize);
+            if (ret == ERROR_BUFFER_OVERFLOW) { free(addresses); addresses = nullptr; }
+        }
+        if (ret == NO_ERROR && addresses)
+        {
+            for (PIP_ADAPTER_ADDRESSES addr = addresses; addr; addr = addr->Next)
+            {
+                for (PIP_ADAPTER_UNICAST_ADDRESS ua = addr->FirstUnicastAddress; ua; ua = ua->Next)
+                {
+                    char ip[INET6_ADDRSTRLEN] = {};
+                    if (ua->Address.lpSockaddr->sa_family == AF_INET)
+                    {
+                        inet_ntop(AF_INET, &((struct sockaddr_in*)ua->Address.lpSockaddr)->sin_addr, ip, sizeof(ip));
+                    }
+                    else if (ua->Address.lpSockaddr->sa_family == AF_INET6)
+                    {
+                        inet_ntop(AF_INET6, &((struct sockaddr_in6*)ua->Address.lpSockaddr)->sin6_addr, ip, sizeof(ip));
+                    }
+                    if (ip[0] && hostname == ip)
+                    {
+                        free(addresses);
+                        return true;
+                    }
+                }
+            }
+        }
+        if (addresses) free(addresses);
+    }
+#else
+    {
+        struct ifaddrs* ifaddr = nullptr;
+        if (getifaddrs(&ifaddr) == 0)
+        {
+            for (struct ifaddrs* ifa = ifaddr; ifa; ifa = ifa->ifa_next)
+            {
+                if (!ifa->ifa_addr) continue;
+                char ip[INET6_ADDRSTRLEN] = {};
+                if (ifa->ifa_addr->sa_family == AF_INET)
+                {
+                    inet_ntop(AF_INET, &((struct sockaddr_in*)ifa->ifa_addr)->sin_addr, ip, sizeof(ip));
+                }
+                else if (ifa->ifa_addr->sa_family == AF_INET6)
+                {
+                    inet_ntop(AF_INET6, &((struct sockaddr_in6*)ifa->ifa_addr)->sin6_addr, ip, sizeof(ip));
+                }
+                if (ip[0] && hostname == ip)
+                {
+                    freeifaddrs(ifaddr);
+                    return true;
+                }
+            }
+            freeifaddrs(ifaddr);
+        }
+    }
+#endif
+
+    return false;
+}
+
 bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::vector<uint8_t>& buffer)
 {
     if (!curl) return false;
@@ -1568,8 +1704,20 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
 
     // -----------------------------------------------------------------------
     // Kodi Proxy Settings
+    // Bypass proxy for loopback/localhost, consistent with Kodi's CurlFile
     // -----------------------------------------------------------------------
+    bool skip_proxy = false;
     if (m_use_kodi_proxy && !m_proxy_server.empty())
+    {
+        std::string host_with_port = ExtractHost(target_url);
+        std::string hostname = ExtractHostnameOnly(host_with_port);
+        skip_proxy = IsLocalHost(hostname);
+        if (skip_proxy)
+        {
+            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 跳过代理 (localhost/loopback): %s", hostname.c_str());
+        }
+    }
+    if (m_use_kodi_proxy && !m_proxy_server.empty() && !skip_proxy)
     {
         // Map Kodi proxy type index to CURL proxy type constant
         // Kodi settings.xml 选项顺序: 0=HTTP, 1=SOCKS4, 2=SOCKS4A, 3=SOCKS5, 4=SOCKS5H(hostname)
