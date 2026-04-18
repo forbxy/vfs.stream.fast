@@ -78,6 +78,7 @@ public:
     // -----------------------------------------------------------------------
     // Proxy Settings (loaded from guisettings.xml when use_kodi_proxy=true)
     // -----------------------------------------------------------------------
+    bool m_enable_http2 = false;
     bool m_use_kodi_proxy = false;
     int m_proxy_type = 0;           // maps to CURLproxytype
     std::string m_proxy_server;

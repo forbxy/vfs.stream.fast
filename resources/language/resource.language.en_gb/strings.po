@@ -28,3 +28,7 @@ msgstr "LRU Total Cache Size (MB)"
 msgctxt "#30013"
 msgid "Use Kodi Proxy Settings"
 msgstr "Use Kodi Proxy Settings"
+
+msgctxt "#30014"
+msgid "Enable HTTP/2"
+msgstr "Enable HTTP/2"

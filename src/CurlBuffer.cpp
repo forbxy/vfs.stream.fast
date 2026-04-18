@@ -1609,6 +1609,10 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, NULL);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, NULL);
     
+    // HTTP version: 默认 HTTP/1.1, 可通过设置启用 HTTP/2
+    // CURL_HTTP_VERSION_2TLS: HTTPS 时通过 ALPN 协商 HTTP/2，不支持则自动降级 HTTP/1.1
+    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, m_enable_http2 ? CURL_HTTP_VERSION_2TLS : CURL_HTTP_VERSION_1_1);
+
     curl_easy_setopt(curl, CURLOPT_USERAGENT, m_user_agent.c_str());
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
     curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 0L);

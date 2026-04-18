@@ -28,3 +28,7 @@ msgstr "LRU总缓存大小 (MB)"
 msgctxt "#30013"
 msgid "Use Kodi Proxy Settings"
 msgstr "使用 Kodi 代理设置"
+
+msgctxt "#30014"
+msgid "Enable HTTP/2"
+msgstr "启用 HTTP/2"

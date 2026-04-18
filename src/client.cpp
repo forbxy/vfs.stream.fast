@@ -210,6 +210,14 @@ kodi::addon::VFSFileHandle CClientVFS::Open(const kodi::addon::VFSUrl &url)
     if (use_kodi_proxy)
         file->LoadKodiProxySettings();
 
+    // HTTP/2 Support
+    bool enable_http2 = false;
+    if (kodi::addon::CPrivateBase::m_interface && kodi::addon::CPrivateBase::m_interface->toKodi && kodi::addon::CPrivateBase::m_interface->toKodi->kodi_addon) {
+        kodi::addon::CPrivateBase::m_interface->toKodi->kodi_addon->get_setting_bool(
+          kodi::addon::CPrivateBase::m_interface->toKodi->kodiBase, "enable_http2", &enable_http2);
+    }
+    file->m_enable_http2 = enable_http2;
+
     // 初始化我们的加速器
     // 这里传入完整的 VFSUrl 对象，因为我们需要里面的 auth 信息
     if (file->Open(url))

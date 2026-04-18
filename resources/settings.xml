@@ -43,6 +43,11 @@
                     <level>0</level>
                     <default>false</default>
                     <control type="toggle" />
+                </setting>
+                <setting id="enable_http2" type="boolean" label="30014">
+                    <level>0</level>
+                    <default>false</default>
+                    <control type="toggle" />
                 </setting>            </group>
         </category>
     </section>
