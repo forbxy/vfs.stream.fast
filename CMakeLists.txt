@@ -65,6 +65,8 @@ set(SOURCE_FILES
     src/client.h
     src/CurlBuffer.cpp
     src/CurlBuffer.h
+    src/tinyxml2.cpp
+    src/tinyxml2.h
 )
 
 # -----------------------------------------------------------------------------
@@ -76,6 +78,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE ${CURL_TARGET})
 
 if(WIN32)
     target_compile_definitions(${PROJECT_NAME} PRIVATE TARGET_WINDOWS)
+    target_link_libraries(${PROJECT_NAME} PRIVATE iphlpapi ws2_32)
 elseif(ANDROID)
     target_compile_definitions(${PROJECT_NAME} PRIVATE TARGET_ANDROID)
     # Ensure Large File Support on 32-bit Android

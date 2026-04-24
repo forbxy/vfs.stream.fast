@@ -27,6 +27,11 @@ public:
     ssize_t Read(uint8_t *buffer, size_t size);
     int64_t Seek(int64_t position, int whence);
 
+    // 写入接口 (参考 Kodi CurlFile 的 multi-interface 模式)
+    bool OpenForWrite(const kodi::addon::VFSUrl &url, bool overWrite);
+    ssize_t Write(const uint8_t *buffer, size_t size);
+    int Truncate(int64_t size);
+
     int64_t GetPosition() const { return m_logical_position; }
     int64_t GetLength() const { return m_total_size; }
     
@@ -39,26 +44,23 @@ public:
     // Helper for callback
     bool IsTransferAborted() const { return m_abort_transfer; }
 
+    // ISO 延迟关闭支持
+    bool IsIsoFile() const { return m_is_iso; }
+    const std::string& GetOriginalUrl() const { return m_original_kodi_url; }
+    void ResetForReuse(); // 延迟关闭复用时重置逻辑状态
+
     // 状态控制 (Public allow callback access)
     std::atomic<bool> m_is_running = false;
 
     // -----------------------------------------------------------------------
     // 可配置参数区 (Configuration)
     // -----------------------------------------------------------------------
-    size_t m_cfg_head_size = 30 * 1024 * 1024;    // 头部热点缓存大小
-    size_t m_cfg_tail_size = 30 * 1024 * 1024;    // 尾部热点缓存大小
-    size_t m_cfg_middle_size = 20 * 1024 * 1024;  // 中间热点(JIT)缓存大小
+    static size_t LRU_BLOCK_SIZE;          // LRU 块大小
+    static size_t LRU_TOTAL_SIZE;          // LRU 总大小
+    static size_t LRU_MAX_BLOCKS;          // LRU 最大块数
+    static void UpdateLRUSettings(size_t block_size, size_t total_size);
+
     size_t m_cfg_ring_size = 100 * 1024 * 1024;   // 主 RingBuffer 大小
-    size_t m_cfg_history_size = 10 * 1024 * 1024; // 保留历史数据大小
-    int64_t m_cfg_preload_thresh = 10LL * 1024 * 1024 * 1024;   // <10GB 跳过预热(Preload Head/Tail)
-    bool m_cfg_cache_iso_only = true; // [New] 仅 ISO 开启缓存
-
-    // 跳转记录缓存时间 (秒)
-    long m_cfg_redirect_cache_ttl_sec = 14400;
-
-    // [New] 动态缓存屏蔽阈值
-    std::atomic<bool> m_disable_static_caches{false};
-    std::atomic<int64_t> m_accumulated_download_bytes{0};
 
     // -----------------------------------------------------------------------
     // Network Timeouts & Limits
@@ -73,16 +75,32 @@ public:
     
     int m_net_max_retries = 5;
 
+    // -----------------------------------------------------------------------
+    // Proxy Settings (loaded from guisettings.xml when use_kodi_proxy=true)
+    // -----------------------------------------------------------------------
+    bool m_enable_http2 = false;
+    bool m_use_kodi_proxy = false;
+    int m_proxy_type = 0;           // maps to CURLproxytype
+    std::string m_proxy_server;
+    int m_proxy_port = 0;
+    std::string m_proxy_username;
+    std::string m_proxy_password;
+
+    // Read Kodi's guisettings.xml and populate the proxy fields above.
+    // Should be called once after m_use_kodi_proxy is set to true.
+    void LoadKodiProxySettings();
+
 protected:
     // 工作线程入口
     void WorkerThread();
     void StartWorker(); // 延迟启动 Helper
 
     // 状态变量
-    bool m_support_range = true;
+    bool m_support_range = false;
     bool m_is_directory = false;
-    bool m_is_iso = false; // [New] 标记是否为 ISO 文件
-    bool m_is_video = false; 
+    bool m_is_video = false;
+    bool m_is_iso = false;
+    bool m_is_first_read = true; // 快速首次读取标志 (ISO 优化)
     time_t m_mod_time = 0;
     time_t m_access_time = 0;
 
@@ -91,7 +109,6 @@ protected:
     size_t HandleWrite(void *contents, size_t size);
 
     // 缓存填充专用
-    bool PreloadCaches(); // 统一预热函数
     bool DownloadRange(CURL* curl, int64_t start, int64_t length, std::vector<uint8_t>& buffer);
     static size_t CacheWriteCallback(void *contents, size_t size, size_t nmemb, void *userp);
 
@@ -103,14 +120,20 @@ protected:
     void SetupDownloadRangeOptions(CURL* curl, const std::string& target_url, int64_t start, int64_t length);
     void SetupWorkerDownloadOptions(CURL* curl, const std::string& target_url, int64_t start);
 
-    static void UpdateRedirectCacheFromCurl(CURL* curl, const std::string& original_url, const char* context_name, CCurlBuffer* self = nullptr);
+    void UpdateEffectiveUrlFromCurl(CURL* curl, const std::string& original_url, const char* context_name);
     static std::string GetFileExtensionFromUrl(const std::string& url); // [New] Get Extension Helper
+
+    // 写入模式回调 (curl READFUNCTION, 向服务器上传数据)
+    static size_t UploadReadCallback(char *buffer, size_t size, size_t nitems, void *userp);
 
 private:
     // 基础信息
     std::string m_file_url;
+    std::string m_effective_url; // 跳转后的最终地址 (实例级别)
+    std::string m_original_kodi_url; // 原始 Kodi URL (延迟关闭缓存 key)
     std::string m_username;
     std::string m_password;
+    std::string m_user_agent; // Cached at construction, never changes
 
     int64_t m_total_size = 0;                     // 文件总大小
     int64_t m_logical_position = 0;               // Kodi 认为的播放位置
@@ -128,33 +151,29 @@ private:
 
     // 线程
     std::thread m_worker_thread;
-    // CURL *curl_handle = nullptr; // Removed: use pool directly
-
-    // 缓存策略区
-    // 150MB Ring Buffer + 30MB Head + 30MB Tail (Shadow)
-
-    // 1. 环形主缓存
+    // 环形主缓存
     std::vector<uint8_t> ring_buffer;
     size_t m_ring_buffer_size = 0; // 150MB
     size_t m_ring_buffer_head = 0;
     size_t m_ring_buffer_tail = 0;
     size_t m_rb_bytes_available = 0;
 
-    // 2. 头部静态缓存 (0 - 30MB)
-    std::shared_ptr<std::vector<uint8_t>> m_head_buffer;
-    size_t m_head_valid_length = 0;
 
-    // 3. 尾部静态缓存 (Total-30MB - Total)
-    std::shared_ptr<std::vector<uint8_t>> m_tail_buffer;
-    int64_t m_tail_valid_from = -1; // -1 无效
-    // 4. 中间热点缓存 (JIT Cache - 20MB)
-    std::shared_ptr<std::vector<uint8_t>> m_middle_buffer;
-    int64_t m_middle_valid_from = -1; // -1 无效
-    // [New] 标记是否为小文件全量缓存模式
-    bool m_is_small_file_mode = false; 
-
-    bool CreateMiddleCache(int64_t start_pos);
     std::mutex m_ring_buffer_mutex;
     std::condition_variable m_cv_reader; // 读者等数据
     std::condition_variable m_cv_writer; // 写者等空间
+
+    // ----- 写入模式状态 (Write Mode State) -----
+    bool m_for_write = false;
+    bool m_write_error = false;
+    bool m_write_eof = false;
+    CURL* m_write_curl = nullptr;
+    CURLM* m_write_multi = nullptr;
+    int m_write_still_running = 0;
+
+    // 写入缓冲 (READFUNCTION 回调使用)
+    const uint8_t* m_write_buffer = nullptr;
+    size_t m_write_buffer_size = 0;
+    size_t m_write_buffer_pos = 0;
+    bool m_write_paused = false;
 };

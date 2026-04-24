@@ -12,12 +12,18 @@ class CClientVFS : public kodi::addon::CInstanceVFS
 {
 public:
   CClientVFS(const kodi::addon::IInstanceInfo& instance);
-  ~CClientVFS() override = default;
+  ~CClientVFS() override;
 
   // --- 核心 IO 接口 ---
   kodi::addon::VFSFileHandle Open(const kodi::addon::VFSUrl& url) override;
 
+  kodi::addon::VFSFileHandle OpenForWrite(const kodi::addon::VFSUrl& url, bool overWrite) override;
+
   ssize_t Read(kodi::addon::VFSFileHandle context, uint8_t* buffer, size_t uiBufSize) override;
+
+  ssize_t Write(kodi::addon::VFSFileHandle context, const uint8_t* buffer, size_t uiBufSize) override;
+
+  int Truncate(kodi::addon::VFSFileHandle context, int64_t size) override;
 
   int64_t Seek(kodi::addon::VFSFileHandle context, int64_t position, int whence) override;
 
@@ -35,8 +41,12 @@ public:
   // 必须返回 true，否则播放器可能会禁用进度条拖动
   bool IoControlGetSeekPossible(kodi::addon::VFSFileHandle context) override { return true; }
   
-  // 告诉 Kodi 我们想要大块读取 (虽然 Kodi 内部通过 CDVDInputStream 可能会自己分片，但也是一种暗示)
-  int GetChunkSize(kodi::addon::VFSFileHandle context) override { return 1024 * 1024; }
+  int GetChunkSize(kodi::addon::VFSFileHandle context) override {
+    CCurlBuffer* buf = (CCurlBuffer*)context;
+    int chunk = (buf && buf->IsRangeSupported()) ? 256*1024 : 0;
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: GetChunkSize() called, returning %d", chunk);
+    return chunk;
+  }
 };
 
 // ---------------------------------------------------------------------------

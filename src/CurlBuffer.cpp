@@ -2,6 +2,18 @@
 #include <algorithm>
 #include <string>
 #include <cctype>
+#include <cstdlib>
+#ifdef _WIN32
+#include <Windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#else
+#include <unistd.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#endif
 #include <kodi/addon-instance/VFS.h> // for logging
 #include <kodi/General.h>
 #include <kodi/Network.h>
@@ -9,63 +21,119 @@
 #include <thread>
 #include <atomic>
 #include <map>
+#include <list>
+#include <unordered_map>
 #include <sstream>
+#include <memory>
+#include "tinyxml2.h"
+
+size_t CCurlBuffer::LRU_BLOCK_SIZE = 1 * 1024 * 1024;
+size_t CCurlBuffer::LRU_TOTAL_SIZE = 100 * 1024 * 1024;
+size_t CCurlBuffer::LRU_MAX_BLOCKS = CCurlBuffer::LRU_TOTAL_SIZE / CCurlBuffer::LRU_BLOCK_SIZE;
 
 // -----------------------------------------------------------------------------------------
-// 全局数据缓存 (Head & Tail)
+// 全局 LRU 块缓存 (Global LRU Block Cache)
 // -----------------------------------------------------------------------------------------
-// 单文件缓存策略：仅保留最后访问的文件缓存
-struct GlobalDataCacheEntry
+// 替代原有的 Head/Tail/Middle 静态缓存，使用统一的 LRU 块缓存
+// 块大小 = 1MB (与 GetChunkSize 一致)，总容量 100MB = 100 块
+// 支持多文件并发: 使用 (url, block_num) 复合键，不同文件的块共存于同一 LRU
+// 块数据使用 shared_ptr，允许多个线程在锁外安全持有数据引用
+
+struct LRUBlockKey
 {
     std::string url;
-    std::shared_ptr<std::vector<uint8_t>> head_buffer;
-    std::shared_ptr<std::vector<uint8_t>> tail_buffer;
-    size_t head_valid_length = 0;
-    int64_t tail_valid_from = -1;
+    int64_t block_num;
 
-    // 热点缓存 (Middle/JIT Cache)
-    std::shared_ptr<std::vector<uint8_t>> middle_buffer;
-    int64_t middle_valid_from = -1;
-
-    int64_t total_size = 0;
+    bool operator==(const LRUBlockKey& o) const
+    {
+        return block_num == o.block_num && url == o.url;
+    }
 };
 
-static GlobalDataCacheEntry g_data_cache;
-static std::mutex g_data_cache_mutex;
-
-// -----------------------------------------------------------------------------------------
-// 全局 Stat 缓存 (Metadata Cache)
-// -----------------------------------------------------------------------------------------
-struct StatCacheEntry
+struct LRUBlockKeyHash
 {
-    int64_t size = -1;
-    bool exists = false;
-    bool support_range = true; // 默认假设支持，除非被动发现不支持
-    time_t mod_time = 0;
-    time_t access_time = 0;
-    bool is_dir = false;
+    size_t operator()(const LRUBlockKey& k) const
+    {
+        size_t h1 = std::hash<std::string>{}(k.url);
+        size_t h2 = std::hash<int64_t>{}(k.block_num);
+        return h1 ^ (h2 * 2654435761ULL); // Knuth multiplicative hash
+    }
+};
+
+struct LRUBlockCache
+{
+    // LRU 链表: front = 最近使用, back = 最久未用
+    std::list<LRUBlockKey> lru_order;
+
+    // (url, block_num) -> { 在 lru_order 中的迭代器, 块数据(shared_ptr) }
+    std::unordered_map<LRUBlockKey,
+        std::pair<std::list<LRUBlockKey>::iterator, std::shared_ptr<std::vector<uint8_t>>>,
+        LRUBlockKeyHash> blocks;
+
+    // 查询块，命中则提升到 MRU 端，返回 shared_ptr (调用方可在锁外安全使用)
+    std::shared_ptr<std::vector<uint8_t>> Get(const std::string& url, int64_t block_num)
+    {
+        LRUBlockKey key{url, block_num};
+        auto it = blocks.find(key);
+        if (it == blocks.end()) return nullptr;
+        lru_order.splice(lru_order.begin(), lru_order, it->second.first);
+        return it->second.second;
+    }
+
+    // 插入块 (自动驱逐最久未用的块)
+    void Put(const std::string& url, int64_t block_num, const uint8_t* data, size_t size)
+    {
+        LRUBlockKey key{url, block_num};
+        auto it = blocks.find(key);
+        if (it != blocks.end())
+        {
+            it->second.second = std::make_shared<std::vector<uint8_t>>(data, data + size);
+            lru_order.splice(lru_order.begin(), lru_order, it->second.first);
+            return;
+        }
+        while (blocks.size() >= CCurlBuffer::LRU_MAX_BLOCKS && !lru_order.empty())
+        {
+            blocks.erase(lru_order.back());
+            lru_order.pop_back();
+        }
+        lru_order.push_front(key);
+        blocks[key] = { lru_order.begin(), std::make_shared<std::vector<uint8_t>>(data, data + size) };
+    }
+
+    void Clear()
+    {
+        lru_order.clear();
+        blocks.clear();
+    }
+};
+
+static LRUBlockCache g_lru_cache;
+static std::mutex g_lru_cache_mutex;
+
+void CCurlBuffer::UpdateLRUSettings(size_t block_size, size_t total_size)
+{
+    std::lock_guard<std::mutex> lock(g_lru_cache_mutex);
+    if (LRU_BLOCK_SIZE != block_size) {
+        // 块大小改变会导致现有 block_num 计算失效，所以必须清空
+        g_lru_cache.Clear();
+    }
     
-    // 缓存校验信息 (ETag 等，暂略)
-};
+    LRU_BLOCK_SIZE = block_size;
+    LRU_TOTAL_SIZE = total_size;
+    
+    if (LRU_BLOCK_SIZE == 0) LRU_BLOCK_SIZE = 1 * 1024 * 1024; // 兜底
+    LRU_MAX_BLOCKS = LRU_TOTAL_SIZE / LRU_BLOCK_SIZE;
 
-// Key: URL (normalized), Value: StatCacheEntry
-static std::map<std::string, StatCacheEntry> g_stat_cache;
-static std::mutex g_stat_cache_mutex;
+    // 清理超出的块
+    while (g_lru_cache.blocks.size() > LRU_MAX_BLOCKS && !g_lru_cache.lru_order.empty())
+    {
+        g_lru_cache.blocks.erase(g_lru_cache.lru_order.back());
+        g_lru_cache.lru_order.pop_back();
+    }
+}
 
 // -----------------------------------------------------------------------------------------
-// 全局 Redirect 缓存 (302 Cache)
-// -----------------------------------------------------------------------------------------
-// 缓存 302 跳转后的有效 URL，下次直接访问目标地址
-// [Fix] 增加时间戳以支持过期 (1小时)
-struct RedirectCacheEntry
-{
-    std::string target_url;
-    time_t timestamp;
-};
-
-// Key: Original URL, Value: RedirectCacheEntry
-static std::map<std::string, RedirectCacheEntry> g_redirect_cache;
-static std::mutex g_redirect_cache_mutex;
+// (Stat 缓存和 Redirect 缓存已移除，跳转地址改为实例变量 m_effective_url)
 // -----------------------------------------------------------------------------------------
 
 
@@ -114,6 +182,7 @@ static bool IsFatalError(CURLcode res)
 {
     static const std::vector<CURLcode> fatal_errors = {
         CURLE_URL_MALFORMAT,
+        CURLE_COULDNT_RESOLVE_HOST, // Error 6: DNS resolution failed
         CURLE_COULDNT_CONNECT,
         CURLE_SSL_CONNECT_ERROR, // Error 35: SSL handshake failed
         CURLE_GOT_NOTHING // Empty reply, usually means server closed connection immediately, retry rarely helps for HEAD
@@ -125,16 +194,7 @@ static bool IsFatalError(CURLcode res)
     return false;
 }
 
-// -----------------------------------------------------------------------------------------
-// Helper: Get User Agent mimicking Kodi's native behavior
-// -----------------------------------------------------------------------------------------
 
-static std::string GetUserAgent()
-{
-    // Use Kodi's API to get the exact native User-Agent string
-    // This ensures we match 'Kodi/21.2 (Windows NT ...)' exactly
-    return kodi::network::GetUserAgent();
-}
 
 // [New] 获取文件扩展名函数 (使用 libcurl URL API 解析)
 std::string CCurlBuffer::GetFileExtensionFromUrl(const std::string& url)
@@ -144,7 +204,7 @@ std::string CCurlBuffer::GetFileExtensionFromUrl(const std::string& url)
     if(!h) return extension;
 
     // 解析 URL
-    CURLUcode rc = curl_url_set(h, CURLUPART_URL, url.c_str(), 0);
+    CURLUcode rc = curl_url_set(h, CURLUPART_URL, url.c_str(), CURLU_NON_SUPPORT_SCHEME);
     if(!rc) {
         char *path = NULL;
         // 提取 Path 部分 (会自动去除 ?query 和 #fragment)
@@ -168,6 +228,17 @@ std::string CCurlBuffer::GetFileExtensionFromUrl(const std::string& url)
     }
     curl_url_cleanup(h);
     return extension;
+}
+
+// Replace dav:// with http:// and davs:// with https:// for curl compatibility
+static std::string FixDavProtocol(const std::string& url)
+{
+    std::string fixed = url;
+    if (fixed.rfind("dav://", 0) == 0)
+        fixed.replace(0, 6, "http://");
+    else if (fixed.rfind("davs://", 0) == 0)
+        fixed.replace(0, 7, "https://");
+    return fixed;
 }
 
 // -----------------------------------------------------------------------------------------
@@ -208,52 +279,12 @@ static void ReturnCurlHandleToPool(CURL* handle)
     }
 }
 
-// [Fix] 增加 TTL 参数
-static std::string ResolveRedirectUrl(const std::string& input_url, long ttl = 14400)
-{
-    std::string current = input_url;
-    std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
-    time_t now = time(NULL);
 
-    for(int i=0; i<10; i++)
-    {
-        auto it = g_redirect_cache.find(current);
-        if (it != g_redirect_cache.end())
-        {
-            // [Fix] 检查有效期 (默认 4小时)
-            if (now - it->second.timestamp < ttl)
-            {
-                if (it->second.target_url != current)
-                {
-                    current = it->second.target_url;
-                }
-                else
-                {
-                    break;
-                }
-            }
-            else
-            {
-                // 已过期，删除记录并停止递归解析，回退到当前的 URL (即过期的上级)
-                // 这样下次 Curl 请求就会使用这个 URL，重新触发重定向逻辑并更新缓存
-                // FIXME 可能会有多层下级过期的被保留，但影响不大
-                g_redirect_cache.erase(it);
-                break;
-            }
-        }
-        else
-        {
-            break;
-        }
-    }
-    return current;
-}
 
 // -----------------------------------------------------------------------------------------
-// Helper: Update Redirect Cache from CURL effective URL
+// Helper: 从 CURL 有效 URL 更新实例的 m_effective_url
 // -----------------------------------------------------------------------------------------
-// [Fix] 增加 self 指针以更新 m_total_size 等
-void CCurlBuffer::UpdateRedirectCacheFromCurl(CURL* curl, const std::string& original_url, const char* context_name, CCurlBuffer* self)
+void CCurlBuffer::UpdateEffectiveUrlFromCurl(CURL* curl, const std::string& original_url, const char* context_name)
 {
     char *eff_url = NULL;
     curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff_url);
@@ -262,111 +293,138 @@ void CCurlBuffer::UpdateRedirectCacheFromCurl(CURL* curl, const std::string& ori
         std::string effective_url_str(eff_url);
         
         // 只有当有效 URL 与请求的 URL 不同时才认为是跳转
-        // 且不只是协议的区别 (http vs https)
-        // 简单判断: 字符串不相等
         if (original_url != effective_url_str)
         {
-             // 1. 更新全局跳转缓存: A -> B
-             bool is_new_redirect = false;
+             if (m_effective_url != effective_url_str)
              {
-                 std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
-                 
-                 // [Fix] 检查是否已存在相同的跳转记录
-                 auto it = g_redirect_cache.find(original_url);
-                 if (it != g_redirect_cache.end() && it->second.target_url == effective_url_str)
-                 {
-                     return; 
-                 }
-                 else
-                 {
-                     // 不存在或目标改变，写入新记录
-                     RedirectCacheEntry entry;
-                     entry.target_url = effective_url_str;
-                     entry.timestamp = time(NULL);
-                     g_redirect_cache[original_url] = entry;
-                     is_new_redirect = true;
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: %s 检测到跳转: %s -> %s", context_name, original_url.c_str(), effective_url_str.c_str());
+                m_effective_url = effective_url_str;
+             }
+
+             // 如果发生了跳转，尝试从最终响应中获取正确的文件大小
+             int64_t new_size = 0;
+             struct curl_header *h = NULL;
+             
+             // 1. 尝试 Content-Range (Worker/DownloadRange 常用)
+             if (curl_easy_header(curl, "Content-Range", 0, CURLH_HEADER, -1, &h) == CURLHE_OK)
+             {
+                 if (h && h->value) {
+                     std::string cr(h->value);
+                     auto pos = cr.find('/');
+                     if (pos != std::string::npos) {
+                         std::string total_str = cr.substr(pos + 1);
+                         if (total_str != "*" && !total_str.empty()) {
+                             try { new_size = std::stoll(total_str); } catch(...) {}
+                         }
+                     }
                  }
              }
              
-             if (is_new_redirect)
+             // 2. 如果没找到 Range，且是 200 OK (非 Partial)，尝试 Content-Length
+             if (new_size <= 0)
              {
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: %s 检测到跳转: %s -> %s (Added to Cache)", context_name, original_url.c_str(), effective_url_str.c_str());
+                 long response_code = 0;
+                 curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+                 if (response_code == 200)
+                 {
+                     curl_off_t cl = -1;
+                     if (curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl) == CURLE_OK && cl > 0)
+                     {
+                         new_size = (int64_t)cl;
+                     }
+                     else
+                     {
+                         new_size = 0; 
+                     }
+                 }
              }
 
-             // [New] 如果发生了跳转，尝试从最终响应中获取正确的文件大小
-             if (self)
+             // 更新大小 (如果此时我们不知道大小，或者大小不一致)
+             if (new_size > 0 && (m_total_size == 0 || m_total_size != new_size))
              {
-                 int64_t new_size = 0;
-                 struct curl_header *h = NULL;
-                 
-                 // 1. 尝试 Content-Range (Worker/DownloadRange 常用)
-                 if (curl_easy_header(curl, "Content-Range", 0, CURLH_HEADER, -1, &h) == CURLHE_OK)
-                 {
-                     if (h && h->value) {
-                         std::string cr(h->value);
-                         auto pos = cr.find('/');
-                         if (pos != std::string::npos) {
-                             std::string total_str = cr.substr(pos + 1);
-                             if (total_str != "*" && !total_str.empty()) {
-                                 try { new_size = std::stoll(total_str); } catch(...) {}
-                             }
-                         }
-                     }
-                 }
-                 
-                 // 2. 如果没找到 Range，且是 200 OK (非 Partial)，尝试 Content-Length
-                 if (new_size <= 0)
-                 {
-                     long response_code = 0;
-                     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-                     if (response_code == 200)
-                     {
-                         curl_off_t cl = -1;
-                         if (curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl) == CURLE_OK && cl > 0)
-                         {
-                             new_size = (int64_t)cl;
-                         }
-                         // [Explicit] 如果确实拿不到长度 (例如 GZIP 且没 Content-Length)，显式设为 0
-                         // 这样后续逻辑就会禁用静态缓存并使用保守 RingBuffer
-                         else
-                         {
-                             new_size = 0; 
-                             // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Redirect 200 OK but no Content-Length found (likely GZIP/Chunked). Size=0");
-                         }
-                     }
-                 }
-
-                 // 更新大小 (如果此时我们不知道大小，或者大小不一致)
-                 if (new_size > 0 && (self->m_total_size == 0 || self->m_total_size != new_size))
-                 {
-                     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [%s] Redirect target provided new size: %lld (Old: %lld)", context_name, new_size, self->m_total_size);
-                     self->m_total_size = new_size;
-                 }
+                 kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [%s] Redirect target provided new size: %lld (Old: %lld)", context_name, new_size, m_total_size);
+                 m_total_size = new_size;
              }
         }
     }
 }
 
 CCurlBuffer::CCurlBuffer()
+    : m_user_agent(kodi::network::GetUserAgent())
 {
-    // 初始化复用的 Curl 对象
-    // curl_handle = GetCurlHandleFromPool();
 }
 
 CCurlBuffer::~CCurlBuffer()
 {
     Close();
-
-    // if (curl_handle)
-    // {
-    //    ReturnCurlHandleToPool(curl_handle);
-    //    curl_handle = nullptr;
-    // }
 }
 
 void CCurlBuffer::Close()
 {
-    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 调用 Close(), 当前逻辑位置=%lld", m_logical_position);
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 调用 Close(), 当前逻辑位置=%lld, ForWrite=%d", m_logical_position, m_for_write);
+
+    // ----- 写入模式清理 (Write Mode Cleanup) -----
+    if (m_for_write)
+    {
+        // Signal EOF to UploadReadCallback so curl finishes the PUT request gracefully
+        if (m_write_multi && m_write_curl && !m_write_error)
+        {
+            m_write_eof = true;
+            m_write_paused = false;
+            curl_easy_pause(m_write_curl, CURLPAUSE_CONT);
+
+            // Drive multi until transfer completes
+            int still_running = 1;
+            while (still_running)
+            {
+                CURLMcode mc = curl_multi_perform(m_write_multi, &still_running);
+                if (mc != CURLM_OK || !still_running)
+                    break;
+                curl_multi_poll(m_write_multi, NULL, 0, 1000, NULL);
+            }
+
+            // Check final HTTP status
+            CURLMsg *msg;
+            int msgs_left;
+            while ((msg = curl_multi_info_read(m_write_multi, &msgs_left)))
+            {
+                if (msg->msg == CURLMSG_DONE)
+                {
+                    long code = 0;
+                    curl_easy_getinfo(m_write_curl, CURLINFO_RESPONSE_CODE, &code);
+                    if (msg->data.result != CURLE_OK || code >= 400)
+                        kodi::Log(ADDON_LOG_ERROR, "FastVFS: OpenForWrite upload finished with error. HTTP=%ld, CurlCode=%d", code, msg->data.result);
+                    else
+                        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: OpenForWrite upload finished successfully. HTTP=%ld", code);
+                }
+            }
+        }
+
+        if (m_write_multi && m_write_curl)
+        {
+            curl_multi_remove_handle(m_write_multi, m_write_curl);
+        }
+        if (m_write_curl)
+        {
+            curl_easy_cleanup(m_write_curl);
+            m_write_curl = nullptr;
+        }
+        if (m_write_multi)
+        {
+            curl_multi_cleanup(m_write_multi);
+            m_write_multi = nullptr;
+        }
+        m_for_write = false;
+        m_write_error = false;
+        m_write_eof = false;
+        m_write_buffer = nullptr;
+        m_write_buffer_size = 0;
+        m_write_buffer_pos = 0;
+        m_write_paused = false;
+        return;
+    }
+
+    // ----- 读取模式清理 (Read Mode Cleanup) -----
     // 1. 停止标志
     m_is_running = false;
 
@@ -383,6 +441,18 @@ void CCurlBuffer::Close()
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Worker join wait time: %lld ms", (long long)ms);
     }
+}
+
+// -----------------------------------------------------------------------------------------
+// ResetForReuse: 延迟关闭复用时重置逻辑状态 (Worker 线程保持运行)
+// -----------------------------------------------------------------------------------------
+void CCurlBuffer::ResetForReuse()
+{
+    m_logical_position = 0;
+    // 注意: 不重置 m_is_first_read — 延迟关闭复用时已有缓存数据，无需快速首读
+    // Worker 线程、RingBuffer、下载状态全部保留原样
+    // Read() 如需新位置数据会通过 m_trigger_reset 通知 Worker 跳转
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ResetForReuse() -> 逻辑位置归零, Worker 保持运行");
 }
 
 // -----------------------------------------------------------------------------------------
@@ -437,9 +507,16 @@ static void FixDoubleEncoding(std::string& url)
 bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
 {
     m_file_url = url.GetURL();
+    m_original_kodi_url = m_file_url; // 保存原始 URL 用于延迟关闭缓存 key
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 调用 Stat(), URL=%s", m_file_url.c_str());
+
+    // 每次 Stat 都重置这些由探测结果驱动的状态，避免沿用上一次实例状态
+    m_support_range = false;
+    m_is_directory = false;
+    m_mod_time = 0;
+    m_access_time = 0;
     
-    // [Fix] Url Cleaning: Remove Kodi options (after '|')
+    // FIXME Url Cleaning: Remove Kodi options (after '|')
     // libcurl 不处理 '|' 及其后的选项，直接发给服务器会导致 400 或 插件崩溃
     size_t pipe_pos = m_file_url.find('|');
     if (pipe_pos != std::string::npos) {
@@ -462,61 +539,14 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     m_username = url.GetUsername();
     m_password = url.GetPassword();
 
-
-    
-
-    // 协议修复: libcurl 不认识 dav://，只认识 http://
-    // [Fix] 检测 WebDAV (Check protocol before modification)
-    bool isWebDav = (m_file_url.rfind("dav://", 0) == 0) || (m_file_url.rfind("davs://", 0) == 0);
-
-    if (m_file_url.rfind("dav://", 0) == 0)
-        m_file_url.replace(0, 6, "http://");
-    else if (m_file_url.rfind("davs://", 0) == 0)
-        m_file_url.replace(0, 7, "https://");
-
-    // 保存原始地址以用作缓存 Key
-    std::string original_url = m_file_url;
-    
-    // [Init] 初始化 ISO 标志
-    std::string ext = GetFileExtensionFromUrl(original_url);
-    m_is_iso = (ext == "iso");
     // [Init] 初始化 Video 标志
+    std::string ext = GetFileExtensionFromUrl(m_file_url);
     m_is_video = (ext == "mkv" || ext=="iso" || ext == "mp4" || ext == "avi" || ext == "mov" ||  
                   ext == "wmv" || ext == "flv" || ext == "webm" || ext == "m2ts" || 
                   ext == "ts" || ext == "bdmv" || ext == "ifo" || ext == "3gp" ||
                   ext == "rmvb" || ext =="rm" || ext == "vob" || ext == "mpg" || 
                   ext == "mpeg" );
-
-    // ---------------------------------------------------------
-    // 0. 检查全局 Stat 缓存
-    // ---------------------------------------------------------
-    {
-        // 注意：这里使用 m_file_url (可能是 Redirect 后的) 作为 Key
-        // 这意味着 Redirect Cache 必须先于 Stat Cache 检查
-        std::lock_guard<std::mutex> lock(g_stat_cache_mutex);
-        auto it = g_stat_cache.find(m_file_url);
-        if (it != g_stat_cache.end())
-        {
-            const StatCacheEntry& entry = it->second;
-            if (!entry.exists)
-            {
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Cache HIT (Not Found): %s", m_file_url.c_str());
-                return false;
-            }
-            else
-            {
-                m_total_size = entry.size;
-                m_support_range = entry.support_range;
-                m_mod_time = entry.mod_time;
-                m_access_time = entry.access_time;
-                m_is_directory = entry.is_dir;
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Cache HIT (Size: %lld): %s", m_total_size, m_file_url.c_str());
-                return true;
-            }
-        }
-    }
-
-    // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件属性 (Stat) URL: %s", m_file_url.c_str());
+    m_is_iso = (ext == "iso");
 
     // 初始化通用变量
     bool success = false;
@@ -530,25 +560,23 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     // 重置 Handle
     curl_easy_reset(curl);
     
-    std::string target_url = m_file_url;
-    if (m_is_video) {
-        target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
-    }
+    // 使用 m_effective_url（如有之前缓存的跳转地址）
+    std::string target_url = !m_effective_url.empty() ? m_effective_url : m_file_url;
+
+    // Determine WebDAV flag based on actual request target (after redirect resolution)
+    bool isWebDav = (target_url.rfind("dav://", 0) == 0) || (target_url.rfind("davs://", 0) == 0);
+    
+    // Fix dav:// -> http:// for curl compatibility
+    target_url = FixDavProtocol(target_url);
 
     // =========================================================================
     // 策略分支: WebDAV (PROPFIND) vs HTTP (HEAD)
     // =========================================================================
-
-    // =========================================================================
-    // 1. 统一 Stat 重试循环 (WebDAV与HTTP共用)
-    // =========================================================================
     
     struct curl_slist *headers = NULL;
     std::string resp_body;
-    int retries = 0;
     char errbuf[CURL_ERROR_SIZE];
 
-    while (retries < m_net_max_retries)
     {
         curl_easy_reset(curl);
         errbuf[0] = 0;
@@ -557,9 +585,6 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         if (isWebDav)
         {
              // WebDAV Setup
-             if (headers) { curl_slist_free_all(headers); headers = NULL; }
-             resp_body.clear(); 
-             
              SetupStatWebDavOptions(curl, target_url, &headers);
 
              curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](void* buffer, size_t size, size_t nmemb, void* userp) -> size_t {
@@ -581,25 +606,11 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         // Clean headers
         if (headers) { curl_slist_free_all(headers); headers = NULL; }
 
-        if (res == CURLE_OK) break;
-
-        // Fatal Error Check
-        if (IsFatalError(res))
+        if (res != CURLE_OK)
         {
-             kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat WebDAV/HTTP Fatal Error %d. Aborting. Detail: %s", res, errbuf);
-             if (res != CURLE_GOT_NOTHING) {
-                 std::lock_guard<std::mutex> l(g_redirect_cache_mutex); 
-                 g_redirect_cache.erase(m_file_url); 
-             }
-             break;
+            kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat %s Error %d. Detail: %s", isWebDav ? "WebDAV" : "HTTP", res, errbuf);
+            m_effective_url.clear();
         }
-        
-        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat Error %d. Retry %d/%d. Detail: %s", res, retries+1, m_net_max_retries, errbuf);
-        
-        std::lock_guard<std::mutex> l(g_redirect_cache_mutex); g_redirect_cache.erase(m_file_url);
-        
-        retries++;
-        if (retries < m_net_max_retries) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     if (isWebDav)
@@ -742,10 +753,27 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         
         // 对 .bdmv, .IFO, .BDM 等蓝光结构及图片文件，不做 fallback
         // 这些通常确实是小文件 且大多是kodi在频繁的扫文件夹，如果使用get，会穿透webdav缓存，直接访问源服务器，导致账号被风控
-        // FIXME 对于404的fallback是兼容emby-next-gen的无奈之举，需更加严谨的调查改进
         std::string check_ext = GetFileExtensionFromUrl(m_file_url); 
         bool is_sensitive_file = (check_ext == "bdmv" || check_ext == "ifo" || check_ext == "bdm" || 
                                 check_ext == "jpg" || check_ext == "png" || check_ext == "tbn");
+
+        // 检测 Emby-Next-Gen 图片占位响应 (Server: Emby-Next-Gen + Content-Type: image/unknown)
+        // next-gen 的 HEAD 对图片返回 Content-Length: 0 的占位响应，不能 fallback GET，
+        // 否则 GET 会消费掉一次性的 delayed_content，导致后续 Worker 下载时收到 404
+        bool is_emby_nextgen_picture_placeholder = false;
+        if (curl_easy_header(curl, "Server", 0, CURLH_HEADER, -1, &h) == CURLHE_OK && h && h->value)
+        {
+            std::string server_val(h->value);
+            if (server_val.find("Emby-Next-Gen") != std::string::npos && ct)
+            {
+                std::string ct_lower(ct);
+                std::transform(ct_lower.begin(), ct_lower.end(), ct_lower.begin(), ::tolower);
+                if (ct_lower.find("image/unknown") != std::string::npos)
+                {
+                    is_emby_nextgen_picture_placeholder = true;
+                }
+            }
+        }
 
         if (res == CURLE_OK)
         {
@@ -771,7 +799,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                 }
             }
             
-             if (!is_sensitive_file)
+             if (!is_sensitive_file && !is_emby_nextgen_picture_placeholder)
              {
                 // 一些服务器不支持 HEAD 请求，返回 4xx 错误码
                 if (response_code >= 400 && response_code < 500)
@@ -787,8 +815,11 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         }
         else if (res == CURLE_GOT_NOTHING && !is_sensitive_file)
         {
-             kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat HEAD failed with Error 52 (Empty Reply). Server likely does not support HEAD. Fallback to GET 0-1...");
-             need_fallback = true;
+             // 服务器对 HEAD 返回空响应，直接判定为不支持 Range、长度未知
+             kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat HEAD Error 52 (Empty Reply). 判定: 不支持 Range, 长度未知.");
+             m_support_range = false;
+             final_size = 0;
+             response_code = 200; // 视为成功，让后续 Cache 逻辑正确处理
         }
 
         if (need_fallback)
@@ -867,57 +898,39 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     
 
     // ---------------------------------------------------------
-    // Update Redirect Cache (如果发生了跳转)
+    // 更新实例跳转地址 (如果发生了跳转)
     // ---------------------------------------------------------
     if (res == CURLE_OK)
     {
-        UpdateRedirectCacheFromCurl(curl, m_file_url, "Stat", this);
+        UpdateEffectiveUrlFromCurl(curl, m_file_url, "Stat");
     }
 
-    // FIXME 应该在拿到最终的链接后使用所有的跳转路径判断文件格式，目前在UpdateRedirectCacheFromCurl
-    // 里更新is_iso标志，和整体的逻辑有点不一致
-
     // ---------------------------------------------------------
-    // 3. 更新 Stat Cache (通用)
+    // 3. 处理 Stat 结果
     // ---------------------------------------------------------
+    if (response_code == 200 || response_code == 206)
     {
-        std::lock_guard<std::mutex> lock(g_stat_cache_mutex);
-        StatCacheEntry entry;
-
-        if (response_code == 200 || response_code == 206)
+        success = true;
+        m_total_size = final_size;
+        
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Success (%s). Size: %lld, Range: %d, Time: %lld, IsDir: %d", 
+            isWebDav ? "WebDAV" : "HTTP", final_size, m_support_range, (int64_t)m_mod_time, m_is_directory);
+    }
+    else
+    {
+        if (res == CURLE_OK && (response_code == 404 || response_code == 410))
         {
-            success = true;
-            m_total_size = final_size;
-            
-            entry.exists = true;
-            entry.size = final_size;
-            entry.mod_time = m_mod_time;
-            entry.access_time = 0; 
-            entry.support_range = m_support_range;
-            entry.is_dir = m_is_directory;
-            
-             kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Success (%s). Size: %lld, Range: %d, Time: %lld, IsDir: %d", 
-                 isWebDav ? "WebDAV" : "HTTP", final_size, m_support_range, (int64_t)m_mod_time, m_is_directory);
-             
-             // 成功结果总是已缓存
-             g_stat_cache[m_file_url] = entry;
+            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Failed (404/410). Code=%ld", response_code);
+        }
+        else if (res == CURLE_OK && (response_code >= 400 && response_code < 500))
+        {
+            kodi::Log(ADDON_LOG_WARNING, "FastVFS: Stat Failed. CurCode=%d, HTTP=%ld, URL=%s", res, response_code, m_file_url.c_str());
         }
         else
         {
-            // [Fix] 仅明确的 404/410 才缓存 "Not Found"
-            // 不要缓存网络超时(28)、连接拒绝(7)或服务器内部错误(5xx)，以便下次重试
-            if (res == CURLE_OK && (response_code == 404 || response_code == 410))
-            {
-               kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Failed (404/410). Code=%ld (Cached as Not Found)", response_code);
-               entry.exists = false;
-               g_stat_cache[m_file_url] = entry;
-            }
-            else
-            {
-               kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat Error. CurCode=%d, HTTP=%ld, URL=%s (Not Cached, allowing retry)", res, response_code, m_file_url.c_str());
-            }
-            success = false;
+            kodi::Log(ADDON_LOG_ERROR, "FastVFS: Stat Error. CurCode=%d, HTTP=%ld, URL=%s", res, response_code, m_file_url.c_str());
         }
+        success = false;
     }
 
     ReturnCurlHandleToPool(curl);
@@ -927,104 +940,24 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
 bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
 {
     kodi::Log(ADDON_LOG_INFO, "FastVFS: 正在打开文件: %s", url.GetURL().c_str());
-    m_file_url = url.GetURL();
 
-    // [Fix] Url Cleaning: Remove Kodi options (after '|')
-    size_t pipe_pos = m_file_url.find('|');
-    if (pipe_pos != std::string::npos) {
-        m_file_url = m_file_url.substr(0, pipe_pos);
-    }
-
-    if (IsLikelyDoubleEncoded(m_file_url)) {
-        kodi::Log(ADDON_LOG_WARNING, "FastVFS: [Warning] Open() 检测到可能的二次编码 URL (Count >= 2)! (Contains %%25+Hex)");
-        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Original URL: %s", m_file_url.c_str());
-
-        std::string fixed_url_preview = m_file_url;
-        FixDoubleEncoding(fixed_url_preview);
-        kodi::Log(ADDON_LOG_WARNING, "FastVFS: Fixed URL (Preview): %s", fixed_url_preview.c_str());
-
-        // [Reserved] 自动修复代码保留但不执行
-        if (false) FixDoubleEncoding(m_file_url);
-    }
-
-    m_username = url.GetUsername();
-    m_password = url.GetPassword();
-
-    // 协议修复: 某些版本的 libcurl 只能处理 http/https，不认识 dav/davs
-    if (m_file_url.rfind("dav://", 0) == 0)
-        m_file_url.replace(0, 6, "http://");
-    else if (m_file_url.rfind("davs://", 0) == 0)
-        m_file_url.replace(0, 7, "https://");
-
+    // Stat() 内部会处理 URL 清理、双重编码检测、协议修复、auth 提取
     if (!Stat(url))
     {
         return false;
     }
 
     // -------------------------------------------------------------
-    // [Fix] 静态缓存控制 (Static Cache Controller)
-    // -------------------------------------------------------------
-    
-    // 默认启用，后面根据条件禁用
-    m_disable_static_caches = false;
-    
-    // [Small File Optimization] 2MB 以下文件: 强制开启全量缓存，不启动 Worker
-    // 修改为: 如果文件体积 <= 头部缓存配置的 90% (e.g. 30MB -> 27MB), 视为小文件
-    int64_t small_file_thresh = (int64_t)(m_cfg_head_size * 0.9);
-    bool is_small_file = (m_total_size > 0 && m_total_size <= small_file_thresh);
-
-    if (is_small_file)
-    {
-        m_cfg_head_size = (size_t)m_total_size;
-        m_cfg_tail_size = 0; // 头部已覆盖全文，无需尾部
-        // 注意：不禁用 static caches，反而是依靠 static caches 来做 Full Cache
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [优化] 小文件 (%lld <= %lld) -> 启用全量缓存模式.", m_total_size, small_file_thresh);
-    }
-
-    // 1. 如果文件长度未知 (<=0) -> 禁用静态缓存，仅流式
-    if (m_total_size <= 0) {
-        m_disable_static_caches = true;
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件长度未知 (0), 禁用静态缓存模式, 仅使用流式.");
-    }
-    // 2. 如果开启了 [仅ISO缓存] 且当前文件不是ISO -> 禁用静态缓存
-    // 这涵盖了所有 mp4/mkv/ts 等容器，以及任何只要不是 ISO 的文件
-    // [Fix] 如果是小文件优化模式，忽略 ISO 限制
-    else if (m_cfg_cache_iso_only && !m_is_iso && !is_small_file) {
-         m_disable_static_caches = true;
-         // 获取扩展名仅用于日志
-         std::string ext = GetFileExtensionFromUrl(m_file_url);
-         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Config] 仅ISO开启缓存，非ISO文件 (Ext: %s) -> 禁用静态缓存.", ext.c_str());
-    }
-
-
-    // 3. (Fallback) 如果缓存尚未禁用，但文件太小 (< Preload Thresh) -> 禁用静态缓存 (不值得预热)
-    // [Fix] 小文件优化模式例外
-    if (!m_disable_static_caches && m_total_size < m_cfg_preload_thresh && !is_small_file) {
-        m_disable_static_caches = true;
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 文件小于阈值 (%lld < %lld), 禁用静态缓存模式, 仅使用流式.", m_total_size, m_cfg_preload_thresh);
-    }
-
-    // -------------------------------------------------------------
     // 动态内存策略 (Dynamic Memory Policy)
     // -------------------------------------------------------------
-    // 初始化状态标记
-    m_is_small_file_mode = is_small_file;
     
-    // 1. 小文件全量缓存模式：不需要 RingBuffer
-    if (is_small_file)
+    // 1. 如果文件长度未知 (0)，使用保守的 Buffer 大小 (10MB)
+    if (m_total_size <= 0)
     {
-        m_ring_buffer_size = 0;
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 小文件优化 -> 禁用循环缓冲区 (RingBuffer Disabled)，仅使用内存全量缓存.");
+        m_ring_buffer_size = 10 * 1024 * 1024; // 10MB Conservative Buffer
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 未知长度 (0) -> 循环缓冲区: %zu bytes (保守模式)", m_ring_buffer_size);
     }
-    // 2. 如果文件长度未知 (0)，使用保守的 Buffer 大小 (5MB)，避免浪费过多内存，同时保持流式能力
-    else if (m_total_size <= 0)
-    {
-        m_ring_buffer_size = 5 * 1024 * 1024; // 5MB Conservative Buffer
-        // [Dynamic] 当长度为0时，直接将历史数据保留设置为0，防止死锁
-        m_cfg_history_size = 0;
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [Dynamic] 未知长度 (0) -> 循环缓冲区: %zu bytes (保守模式), 历史回溯: 0 (已禁用)", m_ring_buffer_size);
-    }
-    // 3. RingBuffer 大小: 若为常规小文件 (< 配置的 RingBuffer 大小)，Buffer 仅分配文件大小
+    // 2. RingBuffer 大小: 若文件小于配置的 RingBuffer 大小，Buffer 仅分配文件大小
     else if (m_total_size < (int64_t)m_cfg_ring_size)
     {
         // 向上对齐到 64KB
@@ -1042,9 +975,6 @@ bool CCurlBuffer::Open(const kodi::addon::VFSUrl &url)
 
     // 初始化基础状态
     m_logical_position = 0;
-    m_head_valid_length = 0;
-    m_tail_valid_from = -1;
-    m_middle_valid_from = -1; // Reset Middle Cache state
     // 重置运行状态确保安全
     m_is_running = false; 
 
@@ -1109,142 +1039,7 @@ size_t CCurlBuffer::CacheWriteCallback(void *contents, size_t size, size_t nmemb
     return realsize;
 }
 
-bool CCurlBuffer::PreloadCaches()
-{
-    // [Fix] 逻辑已移至 Open，从 PreloadCaches 移除
-    if (m_disable_static_caches)
-    {
-         // 已在 Open 中记录日志
-         return true;
-    }
 
-    // 0. 本地缓存检查 (Local Check) - 避免重复进入 global lock
-    bool need_head = (m_head_valid_length == 0);
-    bool need_tail = (m_total_size > (int64_t)(100 * 1024 * 1024)) && (m_tail_valid_from == -1);
-
-    if (!need_head && !need_tail)
-        return true;
-
-    // Check Global Cache
-    {
-        std::lock_guard<std::mutex> lock(g_data_cache_mutex);
-        if (g_data_cache.url == m_file_url && g_data_cache.total_size == m_total_size)
-        {
-            if (need_head && g_data_cache.head_valid_length > 0)
-            {
-                m_head_buffer = g_data_cache.head_buffer; // Zero-copy pointer assignment
-                m_head_valid_length = g_data_cache.head_valid_length;
-                need_head = false;
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 全局缓存命中: 头部.");
-            }
-            
-            if (need_tail && g_data_cache.tail_valid_from != -1)
-            {
-                m_tail_buffer = g_data_cache.tail_buffer; // Zero-copy pointer assignment
-                m_tail_valid_from = g_data_cache.tail_valid_from;
-                need_tail = false;
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 全局缓存命中: 尾部.");
-            }
-        }
-        else
-        {
-             // URL 不匹配，意味着切换了文件，清空旧缓存以释放内存
-             g_data_cache = GlobalDataCacheEntry();
-             g_data_cache.url = m_file_url;
-        }
-    }
-
-    if (!need_head && !need_tail)
-        return true;
-
-    CURL* curl = GetCurlHandleFromPool();
-    if (!curl) return false;
-
-    // -------------------
-    // 1. 下载头部 (Head)
-    // -------------------
-    if (need_head)
-    {
-        // 懒加载内存分配
-        m_head_buffer = std::make_shared<std::vector<uint8_t>>();
-        m_head_buffer->resize(m_cfg_head_size);
-
-        // 确保清除上一次的状态
-        curl_easy_reset(curl);
-
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 开始下载头部... (0 - %zu)", m_head_buffer->size());
-        if (DownloadRange(curl, 0, m_head_buffer->size(), *m_head_buffer))
-        {
-            m_head_valid_length = m_head_buffer->size();
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 头部下载完成.");
-        }
-        else
-        {
-            kodi::Log(ADDON_LOG_ERROR, "FastVFS: [预热] 头部下载失败.");
-            ReturnCurlHandleToPool(curl);
-            return false;
-        }
-    }
-
-    // -------------------
-    // 2. 下载尾部 (Tail)
-    // -------------------
-    bool ret = true;
-    if (need_tail)
-    {
-        // 懒加载内存分配
-        m_tail_buffer = std::make_shared<std::vector<uint8_t>>();
-        m_tail_buffer->resize(m_cfg_tail_size);
-        
-        int64_t tail_start = m_total_size - m_tail_buffer->size();
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 开始下载尾部... Start: %lld", tail_start);
-        
-        if (DownloadRange(curl, tail_start, m_tail_buffer->size(), *m_tail_buffer))
-        {
-            m_tail_valid_from = tail_start;
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 尾部下载完成. 覆盖范围: %lld - %lld (Total: %lld)", 
-                tail_start, tail_start + (int64_t)m_tail_buffer->size(), m_total_size);
-
-        }
-        else
-        {
-            kodi::Log(ADDON_LOG_ERROR, "FastVFS: [预热] 尾部下载失败.");
-            ret = false;
-        }
-    }
-    
-    ReturnCurlHandleToPool(curl);
-
-    // -------------------
-    // 3. 更新全局缓存
-    // -------------------
-    if (ret)
-    {
-        std::lock_guard<std::mutex> lock(g_data_cache_mutex);
-        // 如果缓存 Key 还是我们开始时的 URL (即没人动过)，或者即使是最终跳转后的 URL (如果有人已经更新了)
-        // 我们都应该更新内容。关键是我们要把最终有效的 m_file_url 存进去。
-        if (g_data_cache.url == m_file_url)
-        {
-            g_data_cache.url = m_file_url; // 确保 Key 是最新的有效 URL (Redirected)
-            g_data_cache.total_size = m_total_size;
-            
-            if (m_head_valid_length > 0)
-            {
-                g_data_cache.head_buffer = m_head_buffer;
-                g_data_cache.head_valid_length = m_head_valid_length;
-            }
-            
-            if (m_tail_valid_from != -1)
-            {
-                g_data_cache.tail_buffer = m_tail_buffer;
-                g_data_cache.tail_valid_from = m_tail_valid_from;
-            }
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [预热] 更新全局缓存成功. URL: %s", m_file_url.c_str());
-        }
-    }
-
-    return ret;
-}
 
 // -----------------------------------------------------------------------------------------
 // Helper: Extract Host from URL (used to detect cross-domain redirects)
@@ -1270,6 +1065,134 @@ static std::string ExtractHost(const std::string& url)
     return url.substr(start, end - start);
 }
 
+// Strip port from host:port string, e.g. "192.168.1.1:5244" -> "192.168.1.1"
+static std::string ExtractHostnameOnly(const std::string& host_and_port)
+{
+    // Handle IPv6 literal: [::1]:port
+    if (!host_and_port.empty() && host_and_port[0] == '[')
+    {
+        size_t bracket = host_and_port.find(']');
+        if (bracket != std::string::npos)
+            return host_and_port.substr(1, bracket - 1);
+    }
+    size_t colon = host_and_port.rfind(':');
+    if (colon == std::string::npos) return host_and_port;
+    return host_and_port.substr(0, colon);
+}
+
+// Helper: case-insensitive string compare
+static bool EqualsNoCase(const std::string& a, const std::string& b)
+{
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i])))
+            return false;
+    }
+    return true;
+}
+
+// Check if the hostname is a loopback/localhost address or matches a local interface.
+// Mirrors Kodi's CNetworkBase::IsLocalHost (xbmc/network/Network.cpp)
+static bool IsLocalHost(const std::string& hostname)
+{
+    if (hostname.empty())
+        return false;
+
+    // 127.0.0.0/8 loopback range
+    if (hostname.rfind("127.", 0) == 0)
+        return true;
+
+    // IPv6 loopback
+    if (hostname == "::1")
+        return true;
+
+    // "localhost" (case-insensitive)
+    if (EqualsNoCase(hostname, "localhost"))
+        return true;
+
+    // Check local machine hostname
+    {
+        char buf[256] = {};
+        if (gethostname(buf, sizeof(buf)) == 0)
+        {
+            buf[sizeof(buf) - 1] = '\0';
+            if (EqualsNoCase(hostname, std::string(buf)))
+                return true;
+        }
+    }
+
+    // Check local network interface IPs
+#ifdef _WIN32
+    {
+        ULONG bufSize = 15000;
+        PIP_ADAPTER_ADDRESSES addresses = nullptr;
+        ULONG ret = ERROR_BUFFER_OVERFLOW;
+        for (int tries = 0; tries < 3 && ret == ERROR_BUFFER_OVERFLOW; ++tries)
+        {
+            addresses = (PIP_ADAPTER_ADDRESSES)malloc(bufSize);
+            if (!addresses) break;
+            ret = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                       nullptr, addresses, &bufSize);
+            if (ret == ERROR_BUFFER_OVERFLOW) { free(addresses); addresses = nullptr; }
+        }
+        if (ret == NO_ERROR && addresses)
+        {
+            for (PIP_ADAPTER_ADDRESSES addr = addresses; addr; addr = addr->Next)
+            {
+                for (PIP_ADAPTER_UNICAST_ADDRESS ua = addr->FirstUnicastAddress; ua; ua = ua->Next)
+                {
+                    char ip[INET6_ADDRSTRLEN] = {};
+                    if (ua->Address.lpSockaddr->sa_family == AF_INET)
+                    {
+                        inet_ntop(AF_INET, &((struct sockaddr_in*)ua->Address.lpSockaddr)->sin_addr, ip, sizeof(ip));
+                    }
+                    else if (ua->Address.lpSockaddr->sa_family == AF_INET6)
+                    {
+                        inet_ntop(AF_INET6, &((struct sockaddr_in6*)ua->Address.lpSockaddr)->sin6_addr, ip, sizeof(ip));
+                    }
+                    if (ip[0] && hostname == ip)
+                    {
+                        free(addresses);
+                        return true;
+                    }
+                }
+            }
+        }
+        if (addresses) free(addresses);
+    }
+#else
+    {
+        struct ifaddrs* ifaddr = nullptr;
+        if (getifaddrs(&ifaddr) == 0)
+        {
+            for (struct ifaddrs* ifa = ifaddr; ifa; ifa = ifa->ifa_next)
+            {
+                if (!ifa->ifa_addr) continue;
+                char ip[INET6_ADDRSTRLEN] = {};
+                if (ifa->ifa_addr->sa_family == AF_INET)
+                {
+                    inet_ntop(AF_INET, &((struct sockaddr_in*)ifa->ifa_addr)->sin_addr, ip, sizeof(ip));
+                }
+                else if (ifa->ifa_addr->sa_family == AF_INET6)
+                {
+                    inet_ntop(AF_INET6, &((struct sockaddr_in6*)ifa->ifa_addr)->sin6_addr, ip, sizeof(ip));
+                }
+                if (ip[0] && hostname == ip)
+                {
+                    freeifaddrs(ifaddr);
+                    return true;
+                }
+            }
+            freeifaddrs(ifaddr);
+        }
+    }
+#endif
+
+    return false;
+}
+
 bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::vector<uint8_t>& buffer)
 {
     if (!curl) return false;
@@ -1283,7 +1206,6 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
     while (retries < m_net_max_retries)
     {
         // 复用 SetupCurlOptions 的部分逻辑，但需要手动设置 WriteFunction
-        // 同样使用 ResolveRedirectUrl 确保预热请求也是最新的
         // [Retry] 每次重试前重置 handle 状态
         curl_easy_reset(curl);
         errbuf[0] = 0;
@@ -1291,11 +1213,8 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
         // 设置错误信息缓冲区
         curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
-        std::string target_url = m_file_url;
-        if (m_is_video)
-        {
-            target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
-        }
+        std::string target_url = !m_effective_url.empty() ? m_effective_url : m_file_url;
+        target_url = FixDavProtocol(target_url);
     
         // Use new helper
         SetupDownloadRangeOptions(curl, target_url, start, length);
@@ -1328,7 +1247,7 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
             // ---------------------------------------------------------
             // Update Redirect Cache (如果发生了跳转)
             // ---------------------------------------------------------
-            UpdateRedirectCacheFromCurl(curl, m_file_url, "DownloadRange", this); // will use this->m_total_size
+            UpdateEffectiveUrlFromCurl(curl, m_file_url, "DownloadRange");
 
             // 检查 HTTP Code
             if (response_code >= 200 && response_code < 300)
@@ -1353,11 +1272,8 @@ bool CCurlBuffer::DownloadRange(CURL* curl, int64_t start, int64_t length, std::
               kodi::Log(ADDON_LOG_ERROR, "FastVFS: DownloadRange 失败. Code=%d, HTTP=%ld. Retry (%d/%d). Detail: %s", res, response_code, retries + 1, m_net_max_retries, errbuf);
         }
         
-        // [Fix] 无论是超时还是错误，都清除跳转缓存，确保重试时使用最新链接
-        {
-            std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
-            g_redirect_cache.erase(m_file_url);
-        }
+        // 清除跳转地址，确保重试时使用原始 URL 重新触发重定向
+        m_effective_url.clear();
 
         retries++;
         if (retries < m_net_max_retries)
@@ -1456,10 +1372,8 @@ void CCurlBuffer::WorkerThread()
         errbuf[0] = 0;
         curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
-        std::string target_url = m_file_url;
-        if (m_is_video) {
-            target_url = ResolveRedirectUrl(m_file_url, m_cfg_redirect_cache_ttl_sec);
-        }
+        std::string target_url = !m_effective_url.empty() ? m_effective_url : m_file_url;
+        target_url = FixDavProtocol(target_url);
 
         SetupWorkerDownloadOptions(curl, target_url, m_download_position);
         
@@ -1473,11 +1387,39 @@ void CCurlBuffer::WorkerThread()
         }
 
         // ---------------------------------------------------------
-        // Update Redirect Cache
+        // Update Redirect Cache (对所有已建立连接的情况都更新，不仅限于 CURLE_OK)
         // ---------------------------------------------------------
-        if (res == CURLE_OK)
         {
-            UpdateRedirectCacheFromCurl(curl, m_file_url, "Worker", this);
+            long resp_code = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp_code);
+            if (resp_code > 0)
+            {
+                UpdateEffectiveUrlFromCurl(curl, m_file_url, "Worker");
+            }
+        }
+
+        // 运行时动态纠偏 (CURLE_OK 后的冗余检查，Header 回调已提前处理)
+        if (res == CURLE_OK && !m_support_range)
+        {
+            long response_code = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+
+            bool supports_range_now = (response_code == 206);
+            if (!supports_range_now)
+            {
+                struct curl_header* h = NULL;
+                if (curl_easy_header(curl, "Accept-Ranges", 0, CURLH_HEADER, -1, &h) == CURLHE_OK)
+                {
+                    if (h && h->value && std::string(h->value).find("bytes") != std::string::npos)
+                        supports_range_now = true;
+                }
+            }
+
+            if (supports_range_now)
+            {
+                m_support_range = true;
+                kodi::Log(ADDON_LOG_INFO, "FastVFS: [Dynamic] Worker 检测到最终地址支持 Range，已重新启用 LRU/Range 模式");
+            }
         }
 
         // ---------------------------------------------------------
@@ -1530,13 +1472,8 @@ void CCurlBuffer::WorkerThread()
                 kodi::Log(ADDON_LOG_ERROR, "FastVFS: Curl 错误: %d. 重试 %d/%d", res, retries, m_net_max_retries);
             }
 
-            // [New] 发生错误时和超时时都清除 302 缓存，确保重试时使用原始 URL
-            // 这可以防止因为 CDN 链接过期 (403/410) 或 IP 变动导致的持续错误
-            // 下一次 SetupCurlOptions 会重新解析，libcurl 会自动处理跳转并触发 UpdateRedirectCacheFromCurl 更新缓存
-            {
-                std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
-                g_redirect_cache.erase(m_file_url);
-            }
+            // 发生错误时清除跳转地址，确保重试时使用原始 URL 重新触发重定向
+            m_effective_url.clear();
 
             // [优化] 如果连接断开但缓冲区数据充足，先消耗缓冲区，避免立即重连
             // 场景: 暂停很久 -> 服务器断连 -> Keepalive 发现报错 -> 此时 Buffer 可能是满的
@@ -1587,7 +1524,82 @@ void CCurlBuffer::WorkerThread()
     ReturnCurlHandleToPool(curl);
 }
 
-// (Function ProgressCallback removed as it is superseded by WorkerProgressCallback)
+// -----------------------------------------------------------------------------------------
+// LoadKodiProxySettings: 从 guisettings.xml 中解析 Kodi 全局代理设置
+// -----------------------------------------------------------------------------------------
+void CCurlBuffer::LoadKodiProxySettings()
+{
+    // guisettings.xml 路径 (special://userdata 在 Kodi 内部用 kodi::vfs::TranslateSpecialProtocol 解析)
+    std::string guisettings_path = kodi::vfs::TranslateSpecialProtocol("special://userdata/guisettings.xml");
+    if (guisettings_path.empty())
+    {
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: LoadKodiProxySettings - 无法解析 guisettings.xml 路径");
+        return;
+    }
+
+    tinyxml2::XMLDocument doc;
+    if (doc.LoadFile(guisettings_path.c_str()) != tinyxml2::XML_SUCCESS)
+    {
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: LoadKodiProxySettings - 无法加载 guisettings.xml: %s", guisettings_path.c_str());
+        return;
+    }
+
+    tinyxml2::XMLElement* root = doc.FirstChildElement("settings");
+    if (!root)
+    {
+        kodi::Log(ADDON_LOG_WARNING, "FastVFS: LoadKodiProxySettings - guisettings.xml 根节点不是 <settings>");
+        return;
+    }
+
+    bool use_proxy = false;
+    int proxy_type = 0;
+    std::string proxy_server;
+    int proxy_port = 0;
+    std::string proxy_user;
+    std::string proxy_pass;
+
+    for (tinyxml2::XMLElement* setting = root->FirstChildElement("setting");
+         setting != nullptr;
+         setting = setting->NextSiblingElement("setting"))
+    {
+        const char* id = setting->Attribute("id");
+        if (!id) continue;
+        const char* text = setting->GetText();
+        if (!text) continue;
+
+        std::string sid(id);
+        if (sid == "network.usehttpproxy")
+            use_proxy = (std::string(text) == "true");
+        else if (sid == "network.httpproxytype")
+            proxy_type = atoi(text);
+        else if (sid == "network.httpproxyserver")
+            proxy_server = text;
+        else if (sid == "network.httpproxyport")
+            proxy_port = atoi(text);
+        else if (sid == "network.httpproxyusername")
+            proxy_user = text;
+        else if (sid == "network.httpproxypassword")
+            proxy_pass = text;
+    }
+
+    if (!use_proxy || proxy_server.empty())
+    {
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: LoadKodiProxySettings - Kodi 代理未启用或服务器地址为空，跳过");
+        m_use_kodi_proxy = false;
+        return;
+    }
+
+    m_proxy_type = proxy_type;
+    m_proxy_server = proxy_server;
+    m_proxy_port = proxy_port;
+    m_proxy_username = proxy_user;
+    m_proxy_password = proxy_pass;
+
+    kodi::Log(ADDON_LOG_INFO,
+        "FastVFS: LoadKodiProxySettings - 已加载代理: type=%d, %s:%d, user=%s",
+        proxy_type, proxy_server.c_str(), proxy_port,
+        proxy_user.empty() ? "(none)" : proxy_user.c_str());
+}
 
 void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url)
 {
@@ -1597,7 +1609,11 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, NULL);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, NULL);
     
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, GetUserAgent().c_str());
+    // HTTP version: 默认 HTTP/1.1, 可通过设置启用 HTTP/2
+    // CURL_HTTP_VERSION_2TLS: HTTPS 时通过 ALPN 协商 HTTP/2，不支持则自动降级 HTTP/1.1
+    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, m_enable_http2 ? CURL_HTTP_VERSION_2TLS : CURL_HTTP_VERSION_1_1);
+
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, m_user_agent.c_str());
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
     curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 0L);
     curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
@@ -1606,8 +1622,8 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
     // URL & Auth
     curl_easy_setopt(curl, CURLOPT_URL, target_url.c_str());
 
+    // Don't send credentials to a different host (e.g. CDN after redirect)
     bool should_send_auth = true;
-    if (target_url != m_file_url)
     {
         std::string host_origin = ExtractHost(m_file_url);
         std::string host_target = ExtractHost(target_url);
@@ -1685,7 +1701,6 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
         }
     }
 
-    // SSL & Redirects
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     // [Fix] Allow all redirect
@@ -1707,6 +1722,51 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
 
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, m_net_low_speed_time_sec);
+
+    // -----------------------------------------------------------------------
+    // Kodi Proxy Settings
+    // Bypass proxy for loopback/localhost, consistent with Kodi's CurlFile
+    // -----------------------------------------------------------------------
+    bool skip_proxy = false;
+    if (m_use_kodi_proxy && !m_proxy_server.empty())
+    {
+        std::string host_with_port = ExtractHost(target_url);
+        std::string hostname = ExtractHostnameOnly(host_with_port);
+        skip_proxy = IsLocalHost(hostname);
+        if (skip_proxy)
+        {
+            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 跳过代理 (localhost/loopback): %s", hostname.c_str());
+        }
+    }
+    if (m_use_kodi_proxy && !m_proxy_server.empty() && !skip_proxy)
+    {
+        // Map Kodi proxy type index to CURL proxy type constant
+        // Kodi settings.xml 选项顺序: 0=HTTP, 1=SOCKS4, 2=SOCKS4A, 3=SOCKS5, 4=SOCKS5H(hostname)
+        curl_proxytype curl_ptype = CURLPROXY_HTTP;
+        switch (m_proxy_type)
+        {
+            case 0: curl_ptype = CURLPROXY_HTTP;           break;
+            case 1: curl_ptype = CURLPROXY_SOCKS4;         break;
+            case 2: curl_ptype = CURLPROXY_SOCKS4A;        break;
+            case 3: curl_ptype = CURLPROXY_SOCKS5;         break;
+            case 4: curl_ptype = CURLPROXY_SOCKS5_HOSTNAME;break;
+            default: curl_ptype = CURLPROXY_HTTP;          break;
+        }
+        curl_easy_setopt(curl, CURLOPT_PROXYTYPE, (long)curl_ptype);
+        curl_easy_setopt(curl, CURLOPT_PROXY, m_proxy_server.c_str());
+        curl_easy_setopt(curl, CURLOPT_PROXYPORT, (long)m_proxy_port);
+
+        if (!m_proxy_username.empty())
+        {
+            std::string userpwd = m_proxy_username + ":" + m_proxy_password;
+            curl_easy_setopt(curl, CURLOPT_PROXYUSERPWD, userpwd.c_str());
+        }
+    }
+    else
+    {
+        // 明确清除代理，避免连接池中旧 handle 残留代理设置
+        curl_easy_setopt(curl, CURLOPT_PROXY, "");
+    }
 }
 
 void CCurlBuffer::SetupStatWebDavOptions(CURL* curl, const std::string& target_url, struct curl_slist** headers_out)
@@ -1768,7 +1828,21 @@ void CCurlBuffer::SetupWorkerDownloadOptions(CURL* curl, const std::string& targ
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CCurlBuffer::WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, this);
     curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 1 * 1024 * 1024);
-    curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)start);
+
+    if (m_support_range)
+    {
+        // 不用 CURLOPT_RESUME_FROM_LARGE: libcurl 把 RESUME_FROM_LARGE(0) 视为 no-op,
+        // 导致 start=0 时不发送 Range header, 服务器返回 200 全量而非 206.
+        // 改用 CURLOPT_RANGE 可以正确发送 "Range: bytes=0-" 等所有情况.
+        std::string range_str = std::to_string(start) + "-";
+        curl_easy_setopt(curl, CURLOPT_RANGE, range_str.c_str());
+    }
+    else
+    {
+        // 不支持 Range 的流必须按顺序连续读取，不能带偏移续传
+        curl_easy_setopt(curl, CURLOPT_RANGE, NULL);
+        curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)0);
+    }
 }
 
 size_t CCurlBuffer::WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
@@ -1783,24 +1857,6 @@ size_t CCurlBuffer::HandleWrite(void *contents, size_t size)
         return 0;
 
     std::unique_lock<std::mutex> lock(m_ring_buffer_mutex);
-
-    // [New] 更新累计下载并检查阈值
-    // 阈值规则: max(头部+尾部+JIT, 500MB)
-    // 注意：只要 m_disable_static_caches 变成 true，就不再变回去
-    if (!m_disable_static_caches)
-    {
-        m_accumulated_download_bytes += size;
-        
-        // 计算阈值 (动态计算避免初始化顺序问题，且开销极小)
-        int64_t threshold = std::max((size_t)(500 * 1024 * 1024), m_cfg_head_size + m_cfg_tail_size + m_cfg_middle_size);
-        
-        if (m_accumulated_download_bytes > threshold)
-        {
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 累计下载超过阈值 (%lld > %lld). 屏蔽静态缓存.", 
-                (int64_t)m_accumulated_download_bytes, threshold);
-            m_disable_static_caches = true;
-        }
-    }
 
     // ---------------------------------------------------------
     // 常规写入环形缓冲区 (Ring Buffer Write Only)
@@ -1855,28 +1911,9 @@ size_t CCurlBuffer::HandleWrite(void *contents, size_t size)
 
 ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
 {
-    // ---------------------------------------------------------
-    // 0. 延迟预热检查 (Lazy Preload Check)
-    // ---------------------------------------------------------
-    // 每次 Read 前确保头尾缓存就绪 (如果是大文件且未初始化)
-    // PreloadCaches 内部有状态检查，初始化过的会直接返回 true，开销极小
-    // 注意: 这里不加锁 buffer_mutex，因为 PreloadCaches 是独立的连接操作，且只在初始化时写入
-    // 另外，如果下载失败，返回 -1 通知 Kodi 错误
-    
-    // [Fix] 仅当没有禁用静态缓存时才执行预热检查
-    if (!m_disable_static_caches)
-    {
-        if (!PreloadCaches())
-        {
-            kodi::Log(ADDON_LOG_ERROR, "FastVFS: Read 失败 - 预热缓存下载失败");
-            return -1; // 返回 -1 表示读错误
-        }
-    }
-
-    std::unique_lock<std::mutex> lock(m_ring_buffer_mutex);
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read() 请求 %zu bytes (Pos: %lld)", size, m_logical_position);
 
-    // [EOF Check] 
+    // [EOF Check]
     if (m_total_size > 0 && m_logical_position >= m_total_size)
     {
          kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read() EOF Reached (Pos >= Total). Returning 0.");
@@ -1885,348 +1922,334 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
 
     size_t total_read = 0;
 
-    // ---------------------------------------------------------
-    // 1. 优先检查静态缓存 (Static Caches) - 全命中策略
-    // ---------------------------------------------------------
-    // [New] 超过一定下载量后屏蔽静态缓存，防止大数偏移错误或干扰顺序播放
-    if (!m_disable_static_caches)
-    {
-        // A. 头部缓存 (Head Cache)
-        if (m_logical_position < (int64_t)m_head_valid_length)
-        {
-            // 计算实际需要提供的数据量 (处理 EOF 情况)
-            size_t available_in_cache = (size_t)(m_head_valid_length - m_logical_position);
-            size_t effective_request = size;
-            
-            // 如果文件很小，请求超出了总大小，我们将请求截断到 EOF，这样也算是"完全命中"
-            if (m_total_size > 0 && m_logical_position + (int64_t)size > m_total_size)
-            {
-                effective_request = (size_t)(m_total_size - m_logical_position);
-            }
-
-            // 只有当缓存包含所有"有效"请求数据时才命中
-            // [Fix] 如果是小文件模式，且缓存数据小于预期(Short Read)，但我们已经尽力全量下载了
-            // 那么也应该尽力交付已有的缓存数据，随后依靠 EOF 机制。
-            if (effective_request <= available_in_cache || (m_is_small_file_mode && available_in_cache > 0))
-            {
-                size_t actual_copy = std::min(effective_request, available_in_cache);
-                memcpy(buffer, m_head_buffer->data() + m_logical_position, actual_copy);
-
-
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 完全命中头部缓存. Pos: %lld, Req: %zu, Actual: %zu", m_logical_position, size, actual_copy);
-                m_logical_position += actual_copy;
-                return actual_copy;
-            }
-        }
-
-        // [New] 小文件全量缓存模式专用保护
-        // 如果处于小文件模式，且未命中头部缓存 (Penetrated)，
-        // 这意味着要么是 seek 到了未下载的区域 (不应该发生，因为小文件应全量下载)，
-        // 要么是之前 Stat 错误导致在这里认为还有数据但实际已经是 EOF (或者 Short Read 导致的空洞，但我们不再尝试补全)
-        // 直接返回 -1 以防止死锁或错误的 JIT 调用
-        if (m_is_small_file_mode)
-        {
-             kodi::Log(ADDON_LOG_WARNING, "FastVFS: 小文件全量缓存穿透 (Missed Head). Pos: %lld, HeadValid: %zu. 返回 EOF (0).", 
-                 m_logical_position, m_head_valid_length);
-             return 0;
-        }
-
-        // B. 尾部缓存 (Tail Cache)
-        else if (m_total_size > 0 && m_tail_valid_from != -1 && m_logical_position >= m_tail_valid_from)
-        {
-            // int64_t tail_start = m_total_size - m_tail_buffer->size(); 
-            // [Fix] 直接使用 m_tail_valid_from 作为基准，不再重新计算 tail_start
-            // 因为如果 DownloadRange 发生了 Short Read 导致 buffer resize，重新计算会导致偏移错误
-            {
-                // [Fix] 32-bit Overflow Fix
-                int64_t diff = m_logical_position - m_tail_valid_from;
-                
-                // 只要 offset 在缓存范围内，我们就拥有直到 EOF 的所有数据。
-                if (diff >= 0 && diff < (int64_t)m_tail_buffer->size())
-                {
-                    size_t offset = (size_t)diff;
-                    size_t bytes_left_in_cache = m_tail_buffer->size() - offset;
-                    size_t to_copy = std::min(size, bytes_left_in_cache);
-
-                    memcpy(buffer, m_tail_buffer->data() + offset, to_copy);
-
-                    // [防御性编程] 如果读不满(到了EOF)，将剩余buffer清零，给个"干净的标记"
-                    if (to_copy < size)
-                    {
-                        memset(buffer + to_copy, 0, size - to_copy);
-                    }
-
-                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 完全命中尾部缓存. Pos: %lld, Req: %zu, Actual: %zu%s", 
-                        m_logical_position, size, to_copy, (to_copy < size ? " (EOF)" : ""));
-                    
-                    m_logical_position += to_copy;
-                    return to_copy;
-                }
-            }
-        }
-
-        // ---------------------------------------------------------
-        // C. 如果头尾缓存都未命中，但kodi还是解析ISO，这就是最后的解药。
-        // 中间热点缓存 (JIT Middle Cache) - 针对 ISO 菜单等随机读取优化
-        // ---------------------------------------------------------
-        
-        // 如果 Worker 未运行，且确实需要使用热点缓存（非顺序读取，或者强制使用）
-        // [Fix] 只有当文件大小已知 (>0) 时才允许使用 JIT 缓存。未知大小时无法计算 Range。
-        if (!m_worker_thread.joinable() && m_total_size > 0)
-        {
-            // 尝试获取或创建 JIT Cache
-            // CreateMiddleCache 内部会检查是否已存在有效的覆盖
-            // 注意：原本只针对 Random Seek，现在根据指示，对于 !Worker 的情况直接依赖 JIT
-            
-            // [Optimization] 将下载起始位置向前移动 10%，增加命中几率并覆盖可能的小幅回跳
-            int64_t back_offset = (int64_t)(m_cfg_middle_size / 10);
-            int64_t adjusted_start = (m_logical_position > back_offset) ? (m_logical_position - back_offset) : 0;
-            
-            if (!CreateMiddleCache(adjusted_start))
-            {
-                kodi::Log(ADDON_LOG_ERROR, "FastVFS: CreateMiddleCache 下载失败，Read 终止.");
-                return -1;
-            }
-        }
-
-        // 尝试从 JIT 缓存读取 (CreateMiddleCache 成功后，这里一定会命中，除非 Cache 大小设计问题)
-        if (m_middle_valid_from != -1 && m_logical_position >= m_middle_valid_from)
-        {
-            // [Fix] 32-bit Overflow Fix
-            int64_t diff = m_logical_position - m_middle_valid_from;
-            
-            if (diff >= 0 && diff < (int64_t)m_middle_buffer->size())
-            {
-                size_t offset = (size_t)diff;
-                size_t bytes_left_in_cache = m_middle_buffer->size() - offset;
-                size_t to_copy = std::min(size, bytes_left_in_cache);
-
-                memcpy(buffer, m_middle_buffer->data() + offset, to_copy);
-                
-                // [防御性编程]
-                if (to_copy < size)
-                    memset(buffer + to_copy, 0, size - to_copy);
-
-                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 命中JIT热点缓存. Pos: %lld, Req: %zu, Actual: %zu", m_logical_position, size, to_copy);
-                m_logical_position += to_copy;
-
-                // [JIT 接力机制]
-                // 如果读取进度超过了热点缓存的一半，且 Worker 未启动，说明这可能是一个连续播放行为
-                // 提前启动 Worker，实现无缝衔接 (虽然可能重复下载一小段热点缓存中剩余的数据，但保证了逻辑简单连续)
-                // [优化] 只有当 JIT 缓存没有覆盖到文件末尾时才启动 Worker。如果 JIT 已经包含 EOF，直接用 JIT 读完即可。
-                // [Request] 针对 ISO 文件，禁用 JIT 接力机制 (避免频繁触发 Worker)
-                bool is_covered_to_eof = (m_total_size > 0 && (m_middle_valid_from + (int64_t)m_middle_buffer->size() >= m_total_size));
-
-                // [Optimized] 使用成员变量 m_is_iso，该变量会在 Stat/DownloadRange 的重定向中自动更新
-                if (!m_worker_thread.joinable() && !is_covered_to_eof && !m_is_iso && offset > m_middle_buffer->size() / 2)
-                {
-                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 检测到连续读取 (Offset: %zu > Half), 提前启动 Worker 接力.", offset);
-                    StartWorker();
-                }
-
-                return to_copy;
-            }
-        }
-    } // End of m_disable_static_caches check
-
-    // ---------------------------------------------------------
-    // 延迟初始化 (Lazy Init)
-    // ---------------------------------------------------------
-    // 只有当缓存未命中，且确实需要从 RingBuffer 读取时才启动
-    if (!m_worker_thread.joinable())
-    {
-        StartWorker();
-    }
-
-    // ---------------------------------------------------------
-    // 2. 状态检查与决策 (Decision Making)
-    // ---------------------------------------------------------
-    
-    // 检查 EOF (防止触发 Too Far 误报)
-    if (m_total_size > 0 && m_logical_position >= m_total_size)
-    {
-        return total_read;
-    }
-
-    int64_t buffer_valid_start = m_download_position - m_rb_bytes_available; // 环形队列中数据的起始逻辑位置
-    int64_t buffer_valid_end = m_download_position;                     // 环形队列中数据的结束逻辑位置
-    int64_t plan_limit = m_download_position + (int64_t)m_ring_buffer_size;    // 视为"计划中"的最大范围
-
-    bool need_reset = false;
-
-    // 情况 A: 落后 (Lag) - 数据已被覆盖
-    if (m_logical_position < buffer_valid_start)
-    {
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 落后 (Lag). Req: %lld, BufStart: %lld. 触发瞬移.", m_logical_position, buffer_valid_start);
-        need_reset = true;
-    }
-    // 情况 B: 超前 (Too Far) - 超出计划范围，或者虽然在计划内但差距过大
-    // 如果 Seek 到很远的位置，超过了这个范围，与其等待下载这一大段无用数据，不如直接重置
-    // [Fix] 增加 gap > 20MB 的判断。即使 Buffer 很大(100MB+)，如果 gap 很大，等待下载不如重新连接快。
-    else if (m_logical_position > plan_limit || (m_logical_position - buffer_valid_end) > (16 * 1024 * 1024))
-    {
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 超前 (Too Far/Gap > 16MB). Req: %lld, Limit: %lld, Gap: %lld. 触发瞬移.", 
-            m_logical_position, plan_limit, (int64_t)(m_logical_position - buffer_valid_end));
-        need_reset = true;
-    }
-
-    if (need_reset)
-    {
-        // 1. 设置目标
-        m_reset_target_pos = m_logical_position;
-        // 2. 举旗
-        m_trigger_reset = true;
-        m_abort_transfer = true; // 打断 Worker!
-        // 3. 唤醒可能的睡眠 Worker
-        m_cv_writer.notify_all(); 
-        
-        // 4. 清除错误标志，让 Read 循环继续并进入 wait
-        m_has_error = false;
-        m_is_eof = false; 
-        
-        // 注意：这里不需要 unlock/join。我们持有锁进入下方的 m_cv_reader.wait，释放锁后 Worker 会接管并重置。
-    }
-
-    // 只有在确定不触发重置的情况下，如果处于错误状态，才返回错误
-    // 这样允许通过 Seek (导致 Lag/TooFar -> Reset) 来从错误中恢复
-    if (m_has_error && !need_reset)
-        return -1;
-
-    // ---------------------------------------------------------
-    // 3. 对齐队列头 (Align Ring Buffer Tail/Read Ptr)
-    // ---------------------------------------------------------
-    // 如果逻辑位置在现有数据中间，或者在"计划"中（意味着我们需要跳过当前队列头部的一些旧数据）
-    // 我们必须丢弃 m_ring_buffer_tail 之前直到 m_logical_position 的数据
-    // ---------------------------------------------------------
-    // 3. RingBuffer 读取 (支持保留历史数据)
-    // ---------------------------------------------------------
-
     while (total_read < size)
     {
-        // 计算 Buffer 的绝对范围 (Snapshot of current state)
-        int64_t buf_start = m_download_position - m_rb_bytes_available;
-        int64_t buf_end = m_download_position;
-
-        // [CRITICAL FIX] 检查 Lag (Backward Jump) 情况
-        // 如果逻辑位置在缓冲区开始之前，说明我们也需要等待重置完成
-        // 否则 avail_in_buffer 会计算出巨大的正数(因为减去更小的数)，导致 offset 下溢
-        int64_t avail_in_buffer = 0;
-        
-        if (m_logical_position < buf_start) 
+        if (!m_support_range)
         {
-            // Lag: We are behind. No data available.
-            avail_in_buffer = 0;
-        }
-        else
-        {
-            // Normal or Too Far (Wait)
-            avail_in_buffer = buf_end - m_logical_position;
-        }
-
-        if (avail_in_buffer <= 0)
-        {
-            // [FIX DEADLOCK]: Seek 导致的死锁修复
-            // 当 Seek 向前跳跃 (gap within plan) 时，m_logical_position 超过了 m_download_position。
-            // 此时 Reader 进入 wait (等待数据下载)。
-            // 但如果缓冲区已满 (m_rb_bytes_available == Size)，Writer 线程正阻塞在 wait(m_cv_writer) 等待空间。
-            // Reader 等 Writer，Writer 等 Reader -> 死锁。
-            // 解决方法：在 Reader 进入 wait 前，检查是否因为 Seek 跳过了旧数据，导致可以释放大量空间。
-            // 如果 "已消费+跳过" 的历史数据量 >HistorySize，则主动丢弃，释放 m_rb_bytes_available 并唤醒 Writer。
-
-            int64_t effective_history = m_logical_position - buf_start; // 从 Buffer 起始点到当前请求点的距离
-            if (effective_history > (int64_t)m_cfg_history_size)
+            if (!m_worker_thread.joinable())
             {
-                size_t bytes_to_drop = (size_t)(effective_history - (int64_t)m_cfg_history_size);
-                
-                // 限制不能丢弃超过实际拥有的数据
-                if (bytes_to_drop > m_rb_bytes_available) 
-                    bytes_to_drop = m_rb_bytes_available;
+                StartWorker();
+            }
 
-                if (bytes_to_drop > 0)
+            std::unique_lock<std::mutex> rb_lock(m_ring_buffer_mutex);
+
+            while (m_rb_bytes_available == 0)
+            {
+                if (m_is_eof)
+                    return total_read;
+                if (m_has_error)
+                    return total_read > 0 ? (ssize_t)total_read : -1;
+                if (!m_is_running)
+                    return total_read > 0 ? (ssize_t)total_read : -1;
+
+                if (m_cv_reader.wait_for(rb_lock, std::chrono::seconds(60)) == std::cv_status::timeout)
                 {
-                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 死锁预防 - 主动丢弃 %zu bytes (Seek Gap). Avail Before: %zu", 
-                        bytes_to_drop, m_rb_bytes_available);
-
-                    m_ring_buffer_tail = (m_ring_buffer_tail + bytes_to_drop) % m_ring_buffer_size;
-                    m_rb_bytes_available -= bytes_to_drop;
-                    
-                    // 关键: 唤醒 Writer 起来干活
-                    m_cv_writer.notify_all(); 
-                    
-                    // 重新计算 avail (虽然仍是 <=0，但 Buffer 有空间了，Writer 可以继续跑)
-                    // buf_start = m_download_position - m_rb_bytes_available; 
+                    kodi::Log(ADDON_LOG_ERROR, "FastVFS: 顺序流 Read 严重超时 (60s). 返回错误 (-1).");
+                    return total_read > 0 ? (ssize_t)total_read : -1;
                 }
             }
 
-            // 数据不够，需要等待
-            if (m_is_eof) return total_read; // 已经读到文件末尾
-            if (m_has_error) return -1;
-            
-            // kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read Waiting... (Pos: %lld, BufStart: %lld, BufEnd: %lld)", m_logical_position, buf_start, buf_end);
+            size_t space_to_end = m_ring_buffer_size - m_ring_buffer_tail;
+            size_t to_copy = std::min(size - total_read, std::min(m_rb_bytes_available, space_to_end));
+            memcpy(buffer + total_read, ring_buffer.data() + m_ring_buffer_tail, to_copy);
 
-            // [Fix] 增加等待超时保护 (改为60秒，不做主动重置)
-            // 原逻辑：15秒超时后会主动触发 Worker 重置 (Seek 重连)
-            // 新逻辑：等待 60 秒，如果还等不到直接报错。网络层的重连交给 Worker 自己处理。
-            if (m_cv_reader.wait_for(lock, std::chrono::seconds(60)) == std::cv_status::timeout)
-            {
-                kodi::Log(ADDON_LOG_ERROR, "FastVFS: Read 严重超时 (60s). 缓冲区无数据，强制返回错误 (-1) 以中断播放。");
-                // 强制返回 -1，即使之前可能读到了一点点数据也不返回了，直接让播放器报错更干脆
-                return -1; 
-            }
+            m_ring_buffer_tail = (m_ring_buffer_tail + to_copy) % m_ring_buffer_size;
+            m_rb_bytes_available -= to_copy;
+            total_read += to_copy;
+            m_logical_position += to_copy;
 
-            // 被 Worker 唤醒（或有错误/EOF）
-            if (m_has_error) return -1;
-            if (m_is_eof && m_rb_bytes_available == 0) return total_read; // 双重检查
-
-            // 唤醒后重新检查状态
-            if (!m_is_running) return -1; // 发生重连或停止
+            m_cv_writer.notify_one();
             continue;
         }
 
-        size_t current_need = size - total_read;
-        size_t to_read = std::min(current_need, (size_t)avail_in_buffer);
 
-        // 计算读取起始指针
-        // m_logical_position 一定 >= buf_start (否则上面已经进入 wait)
-        size_t offset_from_tail = (size_t)(m_logical_position - buf_start);
-        size_t read_ptr = (m_ring_buffer_tail + offset_from_tail) % m_ring_buffer_size;
+        int64_t current_pos = m_logical_position;
 
-        // 执行拷贝 (处理 Ring Wrap)
-        size_t copied = 0;
-        while (copied < to_read)
+        // EOF 检查
+        if (m_total_size > 0 && current_pos >= m_total_size)
+            break;
+
+        int64_t block_num = current_pos / LRU_BLOCK_SIZE;
+        size_t block_offset = (size_t)(current_pos % LRU_BLOCK_SIZE);
+
+        // ---------------------------------------------------------
+        // 1. 检查 LRU 块缓存
+        // ---------------------------------------------------------
         {
-            size_t space_to_end = m_ring_buffer_size - read_ptr;
-            size_t chunk = std::min(to_read - copied, space_to_end);
-            
-            memcpy(buffer + total_read + copied, ring_buffer.data() + read_ptr, chunk);
-            
-            read_ptr = (read_ptr + chunk) % m_ring_buffer_size;
-            copied += chunk;
-        }
-
-        total_read += to_read;
-        m_logical_position += to_read;
-        
-        // -----------------------------------------------------
-        // Lazy Pruning: 检查并丢弃过老的历史数据
-        // -----------------------------------------------------
-        // 注意：这里我们使用最新的 m_logical_position 和当前的 buf_start 比较
-        // buf_start (tail) 只有在这里才会被修改
-        
-        int64_t current_history = m_logical_position - buf_start; 
-        if (current_history > (int64_t)m_cfg_history_size)
-        {
-            size_t bytes_to_drop = (size_t)(current_history - (int64_t)m_cfg_history_size);
-            // 限制不超过 m_rb_bytes_available (虽不应发生)
-            if (bytes_to_drop > m_rb_bytes_available) bytes_to_drop = m_rb_bytes_available;
-
-            if (bytes_to_drop > 0)
+            std::shared_ptr<std::vector<uint8_t>> block_ptr;
             {
-                m_ring_buffer_tail = (m_ring_buffer_tail + bytes_to_drop) % m_ring_buffer_size;
-                m_rb_bytes_available -= bytes_to_drop;
-                m_cv_writer.notify_one(); // 通知 Worker 有空位
+                std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                block_ptr = g_lru_cache.Get(m_file_url, block_num);
+            }
+            // shared_ptr 允许在锁外安全使用数据，即使其他线程驱逐了该块
+            if (block_ptr)
+            {
+                size_t block_valid_size = block_ptr->size();
+                if (block_offset < block_valid_size)
+                {
+                    size_t avail = block_valid_size - block_offset;
+                    size_t to_copy = std::min(size - total_read, avail);
+                    memcpy(buffer + total_read, block_ptr->data() + block_offset, to_copy);
+                    total_read += to_copy;
+                    m_logical_position += to_copy;
+                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: LRU 命中 Block#%lld, Offset: %zu, Copy: %zu", block_num, block_offset, to_copy);
+                    continue; // 处理下一块
+                }
+                // block_offset >= block_valid_size: 这是 EOF 处的部分块，且已经读过了
+                break;
             }
         }
+
+        // ---------------------------------------------------------
+        // 2. LRU 未命中 - 小文件直接下载到 LRU (无需 Worker)
+        // ---------------------------------------------------------
+        if (m_total_size > 0 && m_total_size <= (int64_t)LRU_BLOCK_SIZE)
+        {
+            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 小文件优化 (%lld bytes <= LRU_BLOCK_SIZE %zu), 直接 DownloadRange 到 LRU", m_total_size, LRU_BLOCK_SIZE);
+            std::vector<uint8_t> file_data((size_t)m_total_size);
+            CURL* dl_curl = GetCurlHandleFromPool();
+            bool ok = DownloadRange(dl_curl, 0, m_total_size, file_data);
+            ReturnCurlHandleToPool(dl_curl);
+
+            if (ok && !file_data.empty())
+            {
+                {
+                    std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                    g_lru_cache.Put(m_file_url, 0, file_data.data(), file_data.size());
+                }
+                // 从刚写入的数据直接拷贝到输出
+                size_t avail = file_data.size() - block_offset;
+                size_t to_copy = std::min(size - total_read, avail);
+                memcpy(buffer + total_read, file_data.data() + block_offset, to_copy);
+                total_read += to_copy;
+                m_logical_position += to_copy;
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 小文件直接下载成功, 写入 LRU Block#0 (%zu bytes), Read %zu bytes", file_data.size(), to_copy);
+                continue;
+            }
+            else
+            {
+                kodi::Log(ADDON_LOG_WARNING, "FastVFS: 小文件 DownloadRange 失败, 回退到 Worker 模式");
+            }
+        }
+
+
+        // ---------------------------------------------------------
+        // 3. LRU 未命中 - 从 RingBuffer 获取数据填充 LRU
+        // ---------------------------------------------------------
+
+        // 延迟启动 Worker (从 block 对齐位置, 确保完整下载当前 LRU 块)
+        if (!m_worker_thread.joinable())
+        {
+            int64_t aligned_pos = (m_logical_position / LRU_BLOCK_SIZE) * LRU_BLOCK_SIZE;
+            int64_t saved_pos = m_logical_position;
+            m_logical_position = aligned_pos;
+            StartWorker();
+            m_logical_position = saved_pos;
+        }
+
+        // ---------------------------------------------------------
+        // ISO 首读优化: 预取文件尾块 (libbluray 需要读 UDF 文件系统表)
+        // ---------------------------------------------------------
+        // Worker 刚启动正在下载头部, 这里趁机用 DownloadRange 下载尾块。
+        // 先查 LRU, miss 才下载。两个下载并行执行, 省去后续瞬移耗时。
+        if (m_is_first_read && m_is_iso && m_support_range && m_total_size > (int64_t)LRU_BLOCK_SIZE)
+        {
+            m_is_first_read = false;
+
+            int64_t last_block_num = (m_total_size - 1) / (int64_t)LRU_BLOCK_SIZE;
+            if (last_block_num != block_num) // 尾块 != 当前块
+            {
+                std::shared_ptr<std::vector<uint8_t>> tail_cached;
+                {
+                    std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                    tail_cached = g_lru_cache.Get(m_file_url, last_block_num);
+                }
+                if (!tail_cached)
+                {
+                    int64_t last_block_start = last_block_num * (int64_t)LRU_BLOCK_SIZE;
+                    int64_t last_block_size = m_total_size - last_block_start;
+
+                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ★ ISO 首读预取尾块: Block#%lld (pos %lld, size %lld)",
+                        last_block_num, last_block_start, last_block_size);
+
+                    std::vector<uint8_t> tail_data((size_t)last_block_size);
+                    CURL* dl_curl = GetCurlHandleFromPool();
+                    bool ok = DownloadRange(dl_curl, last_block_start, last_block_size, tail_data);
+                    ReturnCurlHandleToPool(dl_curl);
+
+                    if (ok && !tail_data.empty())
+                    {
+                        std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                        g_lru_cache.Put(m_file_url, last_block_num, tail_data.data(), tail_data.size());
+                        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ★ ISO 尾块预取成功, 写入 LRU Block#%lld (%zu bytes)",
+                            last_block_num, tail_data.size());
+                    }
+                    else
+                    {
+                        kodi::Log(ADDON_LOG_WARNING, "FastVFS: ISO 尾块预取失败, 将在后续按需下载");
+                    }
+                }
+            }
+        }
+        else
+        {
+            m_is_first_read = false;
+        }
+
+        // 计算目标块的绝对范围
+        int64_t block_start = block_num * (int64_t)LRU_BLOCK_SIZE;
+        int64_t block_end_ideal = block_start + (int64_t)LRU_BLOCK_SIZE;
+        if (m_total_size > 0)
+            block_end_ideal = std::min(block_end_ideal, m_total_size);
+
+        std::unique_lock<std::mutex> rb_lock(m_ring_buffer_mutex);
+
+        // 内循环: 等待 RingBuffer 中出现完整块数据
+        bool block_populated = false;
+        while (true)
+        {
+            int64_t buf_start = m_download_position - m_rb_bytes_available;
+            int64_t buf_end = m_download_position;
+
+            // 如果到了 EOF，调整块尾边界
+            int64_t block_end = block_end_ideal;
+            if (m_is_eof && m_download_position < block_end)
+                block_end = m_download_position;
+            // 如果 total_size 在运行中被动态修正
+            if (m_total_size > 0 && block_end > m_total_size)
+                block_end = m_total_size;
+
+            size_t block_size = 0;
+            if (block_end > block_start)
+                block_size = (size_t)(block_end - block_start);
+
+            // 检查 RingBuffer 是否覆盖了整个块
+            if (block_size > 0 && block_start >= buf_start && block_end <= buf_end)
+            {
+                // ----- 从环形缓冲区提取块数据 -----
+                std::vector<uint8_t> block_data(block_size);
+                size_t offset_from_tail = (size_t)(block_start - buf_start);
+                size_t read_ptr = (m_ring_buffer_tail + offset_from_tail) % m_ring_buffer_size;
+
+                size_t copied = 0;
+                while (copied < block_size)
+                {
+                    size_t space_to_end = m_ring_buffer_size - read_ptr;
+                    size_t chunk = std::min(block_size - copied, space_to_end);
+                    memcpy(block_data.data() + copied, ring_buffer.data() + read_ptr, chunk);
+                    read_ptr = (read_ptr + chunk) % m_ring_buffer_size;
+                    copied += chunk;
+                }
+
+                // ----- Lazy Pruning: 释放 RingBuffer 中已读过的旧数据 -----
+                {
+                    size_t bytes_to_drop = (size_t)(block_start - buf_start);
+                    if (bytes_to_drop > m_rb_bytes_available)
+                        bytes_to_drop = m_rb_bytes_available;
+                    if (bytes_to_drop > 0)
+                    {
+                        m_ring_buffer_tail = (m_ring_buffer_tail + bytes_to_drop) % m_ring_buffer_size;
+                        m_rb_bytes_available -= bytes_to_drop;
+                        m_cv_writer.notify_one();
+                    }
+                }
+
+                // 释放 RingBuffer 锁后写入 LRU (避免双锁)
+                rb_lock.unlock();
+
+                // ----- 写入 LRU 缓存 -----
+                {
+                    std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                    g_lru_cache.Put(m_file_url, block_num, block_data.data(), block_size);
+                }
+
+                // ----- 拷贝到输出 -----
+                if (block_offset < block_size)
+                {
+                    size_t avail = block_size - block_offset;
+                    size_t to_copy = std::min(size - total_read, avail);
+                    memcpy(buffer + total_read, block_data.data() + block_offset, to_copy);
+                    total_read += to_copy;
+                    m_logical_position += to_copy;
+                }
+
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: RingBuffer -> LRU Block#%lld (%zu bytes). Read %zu bytes.", block_num, block_size, total_read);
+                block_populated = true;
+                break; // 跳出内循环，继续外循环处理下一块
+            }
+
+            // ----- RingBuffer 中没有目标块数据，需要等待或重置 -----
+
+            // 检查是否需要重置 RingBuffer
+            bool need_reset = false;
+            int64_t plan_limit = buf_end + (int64_t)m_ring_buffer_size;
+
+            if (block_start < buf_start)
+            {
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 落后 (Lag). Block: %lld, BufStart: %lld. 触发瞬移.", block_start, buf_start);
+                need_reset = true;
+            }
+            else if (block_start > plan_limit || (block_start - buf_end) > (16 * 1024 * 1024))
+            {
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 超前 (Too Far/Gap > 16MB). Block: %lld, Limit: %lld, Gap: %lld. 触发瞬移.",
+                    block_start, plan_limit, (int64_t)(block_start - buf_end));
+                need_reset = true;
+            }
+
+            if (need_reset)
+            {
+                m_reset_target_pos = block_start;
+                m_trigger_reset = true;
+                m_abort_transfer = true;
+                m_cv_writer.notify_all();
+                m_has_error = false;
+                m_is_eof = false;
+            }
+
+            // 错误状态 (非重置触发的)
+            if (m_has_error && !need_reset)
+            {
+                return total_read > 0 ? (ssize_t)total_read : -1;
+            }
+
+            // EOF 且 RingBuffer 中无此块数据
+            if (m_is_eof && block_start >= m_download_position)
+            {
+                return total_read;
+            }
+
+            // ----- 死锁预防: 主动释放 RingBuffer 中的旧数据为 Writer 腾出空间 -----
+            {
+                size_t bytes_to_drop = (size_t)(block_start - buf_start);
+                if (bytes_to_drop > m_rb_bytes_available)
+                    bytes_to_drop = m_rb_bytes_available;
+                if (bytes_to_drop > 0)
+                {
+                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Read 死锁预防 - 主动丢弃 %zu bytes. Avail Before: %zu", bytes_to_drop, m_rb_bytes_available);
+                    m_ring_buffer_tail = (m_ring_buffer_tail + bytes_to_drop) % m_ring_buffer_size;
+                    m_rb_bytes_available -= bytes_to_drop;
+                    m_cv_writer.notify_all();
+                }
+            }
+
+            // ----- 等待 Worker 填充数据 -----
+            if (m_is_eof) return total_read;
+            if (m_has_error) return total_read > 0 ? (ssize_t)total_read : -1;
+
+            if (m_cv_reader.wait_for(rb_lock, std::chrono::seconds(60)) == std::cv_status::timeout)
+            {
+                kodi::Log(ADDON_LOG_ERROR, "FastVFS: Read 严重超时 (60s). 返回错误 (-1).");
+                return -1;
+            }
+
+            if (m_has_error) return total_read > 0 ? (ssize_t)total_read : -1;
+            if (m_is_eof && m_rb_bytes_available == 0) return total_read;
+            if (!m_is_running) return -1;
+            // 继续内循环，重新检查 RingBuffer
+        }
+
+        if (!block_populated)
+            break; // 无法获取块数据，退出外循环
     }
 
     return total_read;
@@ -2239,9 +2262,10 @@ int64_t CCurlBuffer::Seek(int64_t position, int whence)
     // 例外：Seek 到 0 (通常是刚打开时) 需兼容
     if (!m_support_range)
     {
-        if (whence == SEEK_SET && position == 0)
+        if ((whence == SEEK_SET && position == 0) ||
+            (whence == SEEK_CUR && position == 0))
         {
-            // allowed
+            // allowed: Seek(0) 和 IoControl(IOCTRL_SEEK_POSSIBLE) 兼容
         }
         else
         {
@@ -2275,79 +2299,176 @@ int64_t CCurlBuffer::Seek(int64_t position, int whence)
     return m_logical_position;
 }
 
-bool CCurlBuffer::CreateMiddleCache(int64_t start_pos)
+// -----------------------------------------------------------------------------------------
+// 写入接口 (Write Interface)
+// -----------------------------------------------------------------------------------------
+// 参考 Kodi 原生 CurlFile 的 multi-interface 模式:
+// - OpenForWrite: 设置 CURLOPT_UPLOAD, 使用 curl_multi 驱动
+// - Write: 通过 READFUNCTION 回调向服务器传递数据
+// - UploadReadCallback: curl 拉取数据的回调，数据发完后 PAUSE
+// -----------------------------------------------------------------------------------------
+
+size_t CCurlBuffer::UploadReadCallback(char *buffer, size_t size, size_t nitems, void *userp)
 {
-    // 简化逻辑：只要曾经建立过热点缓存，就认为已就绪 (返回 true)
-    if (m_middle_valid_from != -1) 
+    CCurlBuffer *self = (CCurlBuffer *)userp;
+    if (!self)
+        return 0;
+
+    // EOF signal: Close() sets m_write_buffer_size = 0 to indicate upload is done
+    if (self->m_write_eof)
+        return 0;
+
+    if (self->m_write_buffer_pos >= self->m_write_buffer_size)
     {
-        return true;
+        // 当前 Write() 的数据已全部发送，暂停传输等待下一次 Write()
+        self->m_write_paused = true;
+        return CURL_READFUNC_PAUSE;
     }
-    
-    // **全局缓存检查**: 如果当前实例没有，先查查全局有没有
+
+    size_t max_copy = size * nitems;
+    size_t remaining = self->m_write_buffer_size - self->m_write_buffer_pos;
+    size_t to_copy = std::min(max_copy, remaining);
+
+    memcpy(buffer, self->m_write_buffer + self->m_write_buffer_pos, to_copy);
+    self->m_write_buffer_pos += to_copy;
+
+    return to_copy;
+}
+
+bool CCurlBuffer::OpenForWrite(const kodi::addon::VFSUrl &url, bool overWrite)
+{
+    m_file_url = url.GetURL();
+    kodi::Log(ADDON_LOG_INFO, "FastVFS: OpenForWrite() URL=%s, OverWrite=%d", m_file_url.c_str(), overWrite);
+
+    // URL 清理: 去掉 Kodi 的 '|' 参数
+    size_t pipe_pos = m_file_url.find('|');
+    if (pipe_pos != std::string::npos)
+        m_file_url = m_file_url.substr(0, pipe_pos);
+
+    m_username = url.GetUsername();
+    m_password = url.GetPassword();
+
+    // 检查文件是否已存在 (不覆写时拒绝)
+    if (!overWrite)
     {
-        std::lock_guard<std::mutex> lock(g_data_cache_mutex);
-        if (g_data_cache.url == m_file_url && g_data_cache.middle_valid_from != -1)
+        CCurlBuffer probe;
+        probe.m_net_connect_timeout_sec = m_net_connect_timeout_sec;
+        probe.m_net_read_timeout_sec = m_net_read_timeout_sec;
+        if (probe.Stat(url))
         {
-            m_middle_buffer = g_data_cache.middle_buffer;
-            m_middle_valid_from = g_data_cache.middle_valid_from;
-            kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 复用全局热点缓存. Valid: %lld", m_middle_valid_from);
-            return true;
+            kodi::Log(ADDON_LOG_WARNING, "FastVFS: OpenForWrite 拒绝: 文件已存在且 overWrite=false");
+            return false;
         }
     }
 
-    // 计算预计下载大小 (处理 EOF 边界)
-    size_t expected_size = m_cfg_middle_size;
-    if (m_total_size > 0 && start_pos + (int64_t)expected_size > m_total_size)
+    // 初始化 curl multi 接口 (Kodi CurlFile 同样使用 multi 驱动上传)
+    m_write_curl = curl_easy_init();
+    if (!m_write_curl)
     {
-        int64_t remaining = m_total_size - start_pos;
-        if (remaining < 0) remaining = 0;
-        expected_size = (size_t)remaining;
-    }
-
-    if (expected_size == 0) return false;
-
-    // 分配或调整内存
-    if (!m_middle_buffer) {
-        // 场景 A: 首次分配，直接指定大小，一步到位
-        m_middle_buffer = std::make_shared<std::vector<uint8_t>>(expected_size);
-    }
-    else if (m_middle_buffer->size() != expected_size) {
-        // 场景 B: 复用已有内存，仅调整大小
-        m_middle_buffer->resize(expected_size); 
-    }
-
-    // 获取 handle
-    CURL* curl = GetCurlHandleFromPool();
-    if (!curl) return false;
-
-    curl_easy_reset(curl);
-    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 开始同步下载热点数据. Start: %lld, Size: %zu", start_pos, m_middle_buffer->size());
-
-    bool success = DownloadRange(curl, start_pos, m_middle_buffer->size(), *m_middle_buffer);
-    
-    ReturnCurlHandleToPool(curl);
-
-    if (success)
-    {
-        m_middle_valid_from = start_pos;
-        
-        // 更新全局缓存
-        {
-             std::lock_guard<std::mutex> lock(g_data_cache_mutex);
-             if (g_data_cache.url == m_file_url)
-             {
-                 g_data_cache.middle_buffer = m_middle_buffer;
-                 g_data_cache.middle_valid_from = m_middle_valid_from;
-             }
-        }
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: [JIT] 热点数据下载成功.");
-        return true;
-    }
-    else
-    {
-        kodi::Log(ADDON_LOG_ERROR, "FastVFS: [JIT] 热点数据下载失败.");
-        // 失败意味着没法用 Cache
-        m_middle_valid_from = -1;
+        kodi::Log(ADDON_LOG_ERROR, "FastVFS: OpenForWrite curl_easy_init 失败");
         return false;
     }
+
+    m_write_multi = curl_multi_init();
+    if (!m_write_multi)
+    {
+        curl_easy_cleanup(m_write_curl);
+        m_write_curl = nullptr;
+        kodi::Log(ADDON_LOG_ERROR, "FastVFS: OpenForWrite curl_multi_init 失败");
+        return false;
+    }
+
+    // 配置通用选项 (URL, auth, SSL, redirect, timeout 等)
+    // 协议修复: dav:// -> http://, davs:// -> https:// (仅用于 curl 请求)
+    SetupBaseCurlOptions(m_write_curl, FixDavProtocol(m_file_url));
+
+    // 关键: 启用上传模式 (PUT)
+    curl_easy_setopt(m_write_curl, CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(m_write_curl, CURLOPT_READFUNCTION, UploadReadCallback);
+    curl_easy_setopt(m_write_curl, CURLOPT_READDATA, this);
+
+    // 将 easy handle 加入 multi
+    curl_multi_add_handle(m_write_multi, m_write_curl);
+
+    // 初始化写入状态
+    m_for_write = true;
+    m_write_error = false;
+    m_logical_position = 0;
+    m_write_buffer = nullptr;
+    m_write_buffer_size = 0;
+    m_write_buffer_pos = 0;
+    m_write_paused = false;
+
+    kodi::Log(ADDON_LOG_INFO, "FastVFS: OpenForWrite 成功. URL=%s", m_file_url.c_str());
+    return true;
 }
+
+ssize_t CCurlBuffer::Write(const uint8_t *buffer, size_t size)
+{
+    if (!(m_for_write && m_write_multi && m_write_curl) || m_write_error)
+        return -1;
+
+    // 设置本次 Write 的数据源
+    m_write_buffer = buffer;
+    m_write_buffer_size = size;
+    m_write_buffer_pos = 0;
+    m_write_paused = false;
+
+    // 恢复传输 (UploadReadCallback 暂停后，需要恢复才能继续)
+    curl_easy_pause(m_write_curl, CURLPAUSE_CONT);
+
+    CURLMcode result = CURLM_OK;
+    m_write_still_running = 1;
+
+    // 驱动 multi-interface 直到本次数据全部发送或传输被暂停
+    while (m_write_still_running && !m_write_paused)
+    {
+        result = curl_multi_perform(m_write_multi, &m_write_still_running);
+
+        if (!m_write_still_running)
+            break;
+
+        if (result != CURLM_OK)
+        {
+            long code = 0;
+            curl_easy_getinfo(m_write_curl, CURLINFO_RESPONSE_CODE, &code);
+            kodi::Log(ADDON_LOG_ERROR, "FastVFS: Write 失败. HTTP=%ld, Multi Error=%d", code, result);
+            m_write_error = true;
+            return -1;
+        }
+
+        // Wait for socket activity to avoid busy-spin
+        if (!m_write_paused)
+            curl_multi_poll(m_write_multi, NULL, 0, 1000, NULL);
+    }
+
+    // Check if transfer completed prematurely (server error etc.)
+    if (!m_write_still_running && m_write_buffer_pos < m_write_buffer_size)
+    {
+        CURLMsg *msg;
+        int msgs_left;
+        while ((msg = curl_multi_info_read(m_write_multi, &msgs_left)))
+        {
+            if (msg->msg == CURLMSG_DONE && msg->data.result != CURLE_OK)
+            {
+                long code = 0;
+                curl_easy_getinfo(m_write_curl, CURLINFO_RESPONSE_CODE, &code);
+                kodi::Log(ADDON_LOG_ERROR, "FastVFS: Write transfer ended prematurely. HTTP=%ld, CurlCode=%d", code, msg->data.result);
+                m_write_error = true;
+                return -1;
+            }
+        }
+    }
+
+    ssize_t written = (ssize_t)m_write_buffer_pos;
+    m_logical_position += written;
+    return written;
+}
+
+int CCurlBuffer::Truncate(int64_t size)
+{
+    // HTTP/WebDAV 不支持 Truncate, 与 Kodi CurlFile 行为一致
+    return -1;
+}
+
+
