@@ -28,7 +28,7 @@ This project uses CMake and vcpkg for dependency management.
 - CMake
 - [vcpkg](https://github.com/microsoft/vcpkg)
 - C++ Compiler (MSVC, GCC, Clang)
-- **Kodi Source Code** (Recommended branch: `Omega`)
+- **Kodi Source Code** (Recommended tag/branch: `22.0a3-Piers`)
 
 ### Build Instructions (Windows)
 

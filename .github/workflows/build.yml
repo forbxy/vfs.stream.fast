@@ -82,7 +82,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: xbmc/xbmc
-          ref: Omega  # 建议改为 Omega (Kodi 21) 以获得最佳兼容性
+          ref: 22.0a3-Piers  # Kodi 22 适配分支固定使用 Piers alpha3
           path: kodi_src
           fetch-depth: 1
 

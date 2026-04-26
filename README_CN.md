@@ -28,7 +28,7 @@
 - CMake
 - [vcpkg](https://github.com/microsoft/vcpkg)
 - C++ Compiler (MSVC, GCC, Clang)
-- **Kodi 源码** (推荐分支: `Omega`)
+- **Kodi 源码** (推荐 tag/分支: `22.0a3-Piers`)
 
 ### 编译说明 (Windows)
 
