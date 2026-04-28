@@ -2,22 +2,26 @@
 
 # vfs.stream.fast
 
-**Kodi VFS implementation for WebDAV(s) and HTTP(s) with pre-cached header/footer optimization.**
+**Kodi VFS implementation for WebDAV(s) and HTTP(s) with LRU block cache optimization.**  
+Optimized for `webdav(s)` / `http(s)` protocols, uses LRU eviction to cache file blocks, accelerating Blu-ray ISO startup.  
+With default settings, most ISOs start playback within 5 seconds.
 
-This addon accelerates the playback of large files (like ISOs) over network protocols by caching the beginning and end of files, reducing latency when seeking or starting playback.
+> **Note**: This addon intercepts all HTTP/WebDAV traffic through Kodi VFS, including MKV/MP4 playback, remote poster downloads, and repository installs.  
+> Due to LRU block caching, MKV startup may be slightly slower than Kodi's native VFS (a small difference).
 
-## Features
-
-- **Protocol Support**: Optimized specifically for `webdav(s)` and `http(s)` protocols.
-- **Cache Optimization**: Pre-caches the header and footer of files to improve access times.
-- **Cross-Platform**: Builds available for Windows (x64, x86), Linux (x64, x86, ARM64, ARM), and Android (ARM64, ARMv7).
+Builds available for Windows (x64, x86), Linux (x64, x86, ARM64, ARM), Android (ARM64, ARMv7), macOS (x64, ARM64).
 
 ## Installation
 
 1. Go to the [Releases](../../releases) page.
-2. Download the zip file corresponding to your platform (e.g., `android-aarch64` for Android TV/Shield, `windows-x86_64` for PC).
+2. Download the zip file matching your platform (CoreELEC ng: `linux-armv7`, ne: `linux-aarch64`; other platforms match your Kodi version).
 3. In Kodi, navigate to **Settings** -> **Add-ons** -> **Install from zip file**.
 4. Select the downloaded zip file.
+5. The addon provides block cache size and read-ahead settings. Default values should work out of the box.
+
+Also available via the [repository.forbxy](https://github.com/forbxy/repository.forbxy) repository (recommended, auto-matches your OS and Kodi version).
+
+For Kodi 22 builds (before official release), download from [Actions #24951229291](https://github.com/forbxy/vfs.stream.fast/actions/runs/24951229291).
 
 ## Build from Source
 
@@ -28,7 +32,7 @@ This project uses CMake and vcpkg for dependency management.
 - CMake
 - [vcpkg](https://github.com/microsoft/vcpkg)
 - C++ Compiler (MSVC, GCC, Clang)
-- **Kodi Source Code** (Recommended branch: `Omega`)
+- **Kodi Source Code** (checkout the branch matching your target version, e.g. `Omega` for 21.x)
 
 ### Build Instructions (Windows)
 
@@ -77,3 +81,8 @@ cmake --build . --config Release
 ## License
 
 This software is licensed under the [GNU General Public License v2+ (GPL-2.0-or-later)](LICENSE.txt), consistent with the Kodi project itself.
+
+## Support
+
+USDT_ERC20: `0xa7475effb3f2c5fcb618e8052fc4c45ccc9d9710`  
+BTC: `bc1qa77v8als2f7qradmtmjjy5ad057q9yws6nanx6`

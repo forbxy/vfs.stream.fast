@@ -2,22 +2,28 @@
 
 # vfs.stream.fast
 
-**带头尾缓存优化的 WebDAV(s) 和 HTTP(s) Kodi VFS 实现。**
+**基于 LRU 块缓存的 WebDAV(s) 和 HTTP(s) Kodi VFS 实现。**  
+专为 `webdav(s)` / `http(s)` 协议优化，通过 LRU 淘汰策略缓存文件块，加速蓝光ISO原盘的起播速度。  
+安装后默认参数下，绝大多数 ISO 文件可在 5 秒内开始播放。
 
-此插件通过预先缓存文件的头部和尾部，加速网络协议下大文件（如 ISO）的播放。
+> **注意**：插件会接管一切通过 Kodi VFS 访问的 HTTP/WebDAV 资源，包括播放 MKV/MP4、下载远程海报、从仓库安装插件等。  
+> 因 LRU 块缓存机制，MKV 的起播速度可能略差于 Kodi 原版 VFS（差异很小）。
 
-## 特性
-
-- **协议支持**: 专为 `webdav(s)` 和 `http(s)` 协议优化。
-- **缓存优化**: 预缓存文件头尾以提高访问速度，减少网络IO等待。
-- **跨平台**: 提供 Windows (x64, x86), Linux (x64, x86, ARM64, ARM) 和 Android (ARM64, ARMv7) 的构建版本。
+提供 Windows (x64, x86)、Linux (x64, x86, ARM64, ARM)、Android (ARM64, ARMv7)、macOS (x64, ARM64) 构建版本。
 
 ## 安装
 
 1. 前往 [Releases](../../releases) 页面。
-2. 下载对应您平台的 zip 文件（例如 Android TV/Shield 下载 `android-aarch64`，PC 下载 `windows-x86_64`）。
+2. 下载对应您平台的 zip 文件（coreelec ng分支:linux-alinux-armv7,ne分支linux-aarch64,其他平台和安装的kodi版本保持一致即可）。
 3. 在 Kodi 中，导航至 **设置** -> **插件** -> **从 zip 文件安装**。
 4. 选择下载的 zip 文件。
+5. 设置中提供了一些关于块缓存大小和预读缓存等设置，一般情况下，安装即可加速，无需调整设置
+
+也可通过 [repository.forbxy](https://github.com/forbxy/repository.forbxy) 仓库安装，详细信息见仓库项目主页。  
+仓库安装会自动匹配操作系统和kodi，推荐  
+
+适配kodi 22的插件在22正式发行之前从actions中下载安装 [action:24951229291](https://github.com/forbxy/vfs.stream.fast/actions/runs/24951229291)
+
 
 ## 源码编译
 
@@ -28,7 +34,7 @@
 - CMake
 - [vcpkg](https://github.com/microsoft/vcpkg)
 - C++ Compiler (MSVC, GCC, Clang)
-- **Kodi 源码** (推荐分支: `Omega`)
+- **Kodi 源码** (切到对应版本的分支:例如21.x: `Omega`)
 
 ### 编译说明 (Windows)
 
@@ -78,3 +84,6 @@ cmake --build . --config Release
 
 本软件采用 [GNU General Public License v2+ (GPL-2.0-or-later)](LICENSE.txt) 授权，与 Kodi 项目保持一致。
 
+## 支持作者
+
+<img src="resources/support.jpg" width="300" />
