@@ -18,6 +18,7 @@
   <extension point="kodi.vfs"
              files="true"
              directories="false"
+             supportWrite="true"
              protocols="dav|davs|http|https"
              library_windows="vfs.stream.fast.dll"
              library_linux="libvfs.stream.fast.so"

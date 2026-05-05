@@ -361,6 +361,11 @@ CCurlBuffer::~CCurlBuffer()
 
 void CCurlBuffer::Close()
 {
+    // 防止析构函数与显式调用之间的双重关闭
+    if (m_closed)
+        return;
+    m_closed = true;
+
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 调用 Close(), 当前逻辑位置=%lld, ForWrite=%d", m_logical_position, m_for_write);
 
     // ----- 写入模式清理 (Write Mode Cleanup) -----
@@ -421,6 +426,13 @@ void CCurlBuffer::Close()
         m_write_buffer_size = 0;
         m_write_buffer_pos = 0;
         m_write_paused = false;
+
+        // 写模式同样需要释放自定义请求头
+        if (m_custom_header_list)
+        {
+            curl_slist_free_all(m_custom_header_list);
+            m_custom_header_list = nullptr;
+        }
         return;
     }
 
@@ -441,6 +453,13 @@ void CCurlBuffer::Close()
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Worker join wait time: %lld ms", (long long)ms);
     }
+
+    // Cleanup custom header list from protocol options
+    if (m_custom_header_list)
+    {
+        curl_slist_free_all(m_custom_header_list);
+        m_custom_header_list = nullptr;
+    }
 }
 
 // -----------------------------------------------------------------------------------------
@@ -449,6 +468,7 @@ void CCurlBuffer::Close()
 void CCurlBuffer::ResetForReuse()
 {
     m_logical_position = 0;
+    m_closed = false; // 防御性重置: 确保复用后 Close() 能正常执行
     // 注意: 不重置 m_is_first_read — 延迟关闭复用时已有缓存数据，无需快速首读
     // Worker 线程、RingBuffer、下载状态全部保留原样
     // Read() 如需新位置数据会通过 m_trigger_reset 通知 Worker 跳转
@@ -504,6 +524,286 @@ static void FixDoubleEncoding(std::string& url)
     }
 }
 
+static size_t DiscardWriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
+{
+    (void)ptr;
+    (void)userdata;
+    return size * nmemb;
+}
+
+static std::string StripUrlCredentials(const std::string& url)
+{
+    const size_t scheme_end = url.find("://");
+    if (scheme_end == std::string::npos)
+        return url;
+
+    const size_t authority_start = scheme_end + 3;
+    const size_t path_start = url.find_first_of("/?#", authority_start);
+    const size_t at = url.find('@', authority_start);
+    if (at == std::string::npos || (path_start != std::string::npos && at > path_start))
+        return url;
+
+    return url.substr(0, authority_start) + url.substr(at + 1);
+}
+
+bool CCurlBuffer::ExecuteSimpleRequest(const kodi::addon::VFSUrl& url,
+                                       const char* method,
+                                       const std::vector<std::string>& headers)
+{
+    m_file_url = url.GetURL();
+    ParseProtocolOptions(m_file_url);
+
+    const size_t pipe_pos = m_file_url.find('|');
+    if (pipe_pos != std::string::npos)
+        m_file_url = m_file_url.substr(0, pipe_pos);
+
+    if (IsLikelyDoubleEncoded(m_file_url))
+        FixDoubleEncoding(m_file_url);
+
+    m_username = url.GetUsername();
+    m_password = url.GetPassword();
+
+    CURL* curl = curl_easy_init();
+    if (!curl)
+        return false;
+
+    // 先把 m_custom_header_list 的条目追加到 request_headers，再合并传入的 headers，
+    // 避免 CURLOPT_HTTPHEADER 覆盖 SetupBaseCurlOptions 已设置的自定义协议头
+    struct curl_slist* request_headers = nullptr;
+    if (m_custom_header_list)
+    {
+        for (curl_slist* node = m_custom_header_list; node; node = node->next)
+            request_headers = curl_slist_append(request_headers, node->data);
+    }
+    for (const auto& header : headers)
+        request_headers = curl_slist_append(request_headers, header.c_str());
+
+    SetupBaseCurlOptions(curl, FixDavProtocol(m_file_url));
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, DiscardWriteCallback);
+    if (request_headers)
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, request_headers);
+
+    CURLcode res = curl_easy_perform(curl);
+    long response_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+
+    if (request_headers)
+        curl_slist_free_all(request_headers);
+    curl_easy_cleanup(curl);
+
+    const bool ok = (res == CURLE_OK && response_code >= 200 && response_code < 300);
+    if (!ok)
+    {
+        kodi::Log(ADDON_LOG_WARNING,
+                  "FastVFS: %s failed. Curl=%d HTTP=%ld URL=%s",
+                  method, res, response_code, m_file_url.c_str());
+    }
+    return ok;
+}
+
+bool CCurlBuffer::DeleteUrl(const kodi::addon::VFSUrl& url)
+{
+    return ExecuteSimpleRequest(url, "DELETE");
+}
+
+bool CCurlBuffer::RenameUrl(const kodi::addon::VFSUrl& url, const kodi::addon::VFSUrl& url2)
+{
+    std::string destination = url2.GetURL();
+    const size_t pipe_pos = destination.find('|');
+    if (pipe_pos != std::string::npos)
+        destination = destination.substr(0, pipe_pos);
+    if (IsLikelyDoubleEncoded(destination))
+        FixDoubleEncoding(destination);
+
+    destination = StripUrlCredentials(FixDavProtocol(destination));
+    return ExecuteSimpleRequest(url, "MOVE", {"Destination: " + destination});
+}
+
+bool CCurlBuffer::DirectoryExistsUrl(const kodi::addon::VFSUrl& url)
+{
+    return Stat(url) && IsDirectory();
+}
+
+bool CCurlBuffer::RemoveDirectoryUrl(const kodi::addon::VFSUrl& url)
+{
+    return ExecuteSimpleRequest(url, "DELETE");
+}
+
+bool CCurlBuffer::CreateDirectoryUrl(const kodi::addon::VFSUrl& url)
+{
+    return ExecuteSimpleRequest(url, "MKCOL");
+}
+
+std::string CCurlBuffer::UrlDecode(const std::string& encoded)
+{
+    std::string result;
+    result.reserve(encoded.size());
+    for (size_t i = 0; i < encoded.size(); ++i)
+    {
+        if (encoded[i] == '%' && i + 2 < encoded.size() &&
+            isxdigit(static_cast<unsigned char>(encoded[i + 1])) &&
+            isxdigit(static_cast<unsigned char>(encoded[i + 2])))
+        {
+            char hex[] = {encoded[i + 1], encoded[i + 2], '\0'};
+            result += static_cast<char>(std::strtol(hex, nullptr, 16));
+            i += 2;
+        }
+        else if (encoded[i] == '+')
+        {
+            result += ' ';
+        }
+        else
+        {
+            result += encoded[i];
+        }
+    }
+    return result;
+}
+
+void CCurlBuffer::ParseProtocolOptions(const std::string& original_url)
+{
+    // Reset all protocol options to defaults (match CurlFile constructor defaults)
+    m_referer.clear();
+    m_custom_accept_encoding.clear();
+    m_httpauth.clear();
+    m_cookie.clear();
+    m_cipherlist.clear();
+    m_custom_request.clear();
+    m_connect_timeout_override = 0;
+    m_redirect_limit = -1;
+    m_seekable = true;
+    m_fail_on_error = false;
+    m_verify_peer = true;
+    if (m_custom_header_list)
+    {
+        curl_slist_free_all(m_custom_header_list);
+        m_custom_header_list = nullptr;
+    }
+
+    size_t pipe_pos = original_url.find('|');
+    if (pipe_pos == std::string::npos)
+        return;
+
+    std::string options_str = original_url.substr(pipe_pos + 1);
+    if (options_str.empty())
+        return;
+
+    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 解析协议选项: %s", options_str.c_str());
+
+    size_t pos = 0;
+    while (pos < options_str.size())
+    {
+        size_t amp_pos = options_str.find('&', pos);
+        std::string token = options_str.substr(pos, amp_pos - pos);
+        pos = (amp_pos == std::string::npos) ? options_str.size() : amp_pos + 1;
+
+        if (token.empty())
+            continue;
+
+        size_t eq_pos = token.find('=');
+        if (eq_pos == std::string::npos)
+            continue;
+
+        std::string key_decoded = UrlDecode(token.substr(0, eq_pos));
+        std::string value = UrlDecode(token.substr(eq_pos + 1));
+
+        std::string key = key_decoded;
+        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+
+        // ---- 精确匹配 Kodi CurlFile 支持的参数 ----
+        if (key == "auth")
+        {
+            m_httpauth = value;
+            std::transform(m_httpauth.begin(), m_httpauth.end(), m_httpauth.begin(), ::tolower);
+            if (m_httpauth.empty()) m_httpauth = "any";
+        }
+        else if (key == "referer")
+        {
+            m_referer = value;
+        }
+        else if (key == "user-agent")
+        {
+            m_user_agent = value;
+        }
+        else if (key == "cookie")
+        {
+            m_cookie = value;
+        }
+        else if (key == "acceptencoding" || key == "encoding")
+        {
+            m_custom_accept_encoding = (value == "all") ? "" : value;
+        }
+        else if (key == "accept-charset")
+        {
+            // FastVFS doesn't have charset handling, pass as custom header
+            m_custom_header_list = curl_slist_append(m_custom_header_list,
+                ("Accept-Charset: " + value).c_str());
+        }
+        else if (key == "noshout" && value == "true")
+        {
+            // icecast/shoutcast metadata skip — not applicable to FastVFS, ignore
+        }
+        else if (key == "seekable" && value == "0")
+        {
+            m_seekable = false;
+        }
+        else if (key == "sslcipherlist")
+        {
+            m_cipherlist = value;
+        }
+        else if (key == "connection-timeout")
+        {
+            m_connect_timeout_override = strtol(value.c_str(), nullptr, 10);
+        }
+        else if (key == "failonerror")
+        {
+            m_fail_on_error = (value == "true");
+        }
+        else if (key == "redirect-limit")
+        {
+            m_redirect_limit = strtol(value.c_str(), nullptr, 10);
+        }
+        else if (key == "verifypeer")
+        {
+            if (value == "false")
+                m_verify_peer = false;
+        }
+        else if (key == "postdata")
+        {
+            // POST data — not applicable for streaming VFS, ignore
+        }
+        else if (key == "active-remote")
+        {
+            // DACP remote control — pass as header (match CurlFile behavior)
+            m_custom_header_list = curl_slist_append(m_custom_header_list,
+                ("active-remote: " + value).c_str());
+        }
+        else if (key == "customrequest")
+        {
+            // 与 CurlFile 一致: 存储 value，在 SetupBaseCurlOptions 中通过 CURLOPT_CUSTOMREQUEST 应用
+            m_custom_request = value;
+        }
+        else
+        {
+            // ---- Fallback: 未匹配参数直接作为 HTTP 头 (与 CurlFile 一致) ----
+            if (!key.empty() && key[0] == '!')
+            {
+                // 以 '!' 开头: 去掉 '!' 后作为请求头名称（使用已解码的原始大小写）
+                m_custom_header_list = curl_slist_append(m_custom_header_list,
+                    (key_decoded.substr(1) + ": " + value).c_str());
+            }
+            else
+            {
+                // 直接使用参数名作为请求头名称（使用已解码的原始大小写）
+                m_custom_header_list = curl_slist_append(m_custom_header_list,
+                    (key_decoded + ": " + value).c_str());
+            }
+        }
+    }
+}
+
 bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
 {
     m_file_url = url.GetURL();
@@ -516,13 +816,16 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     m_mod_time = 0;
     m_access_time = 0;
     
-    // FIXME Url Cleaning: Remove Kodi options (after '|')
-    // libcurl 不处理 '|' 及其后的选项，直接发给服务器会导致 400 或 插件崩溃
+    // Parse Kodi protocol options (after '|') before stripping them from the URL
+    ParseProtocolOptions(m_file_url);
+
+    // Remove Kodi options (after '|') from the URL for libcurl
+    // libcurl doesn't handle '|' and would send it to the server causing 400 errors
     size_t pipe_pos = m_file_url.find('|');
     if (pipe_pos != std::string::npos) {
         m_file_url = m_file_url.substr(0, pipe_pos);
     }
-    
+
     // [Detection] 检测二次编码
     if (IsLikelyDoubleEncoded(m_file_url)) {
         kodi::Log(ADDON_LOG_WARNING, "FastVFS: [Warning] 检测到可能的二次编码 URL (Count >= 2)! (Contains %%25+Hex)");
@@ -697,7 +1000,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         bool explicit_accept_ranges = false;
         if (curl_easy_header(curl, "Accept-Ranges", 0, CURLH_HEADER, -1, &h) == CURLHE_OK)
         {
-            if (h && h->value && std::string(h->value).find("bytes") != std::string::npos) 
+            if (h && h->value && std::string(h->value).find("bytes") != std::string::npos)
                 explicit_accept_ranges = true;
         }
 
@@ -1614,8 +1917,30 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, m_enable_http2 ? CURL_HTTP_VERSION_2TLS : CURL_HTTP_VERSION_1_1);
 
     curl_easy_setopt(curl, CURLOPT_USERAGENT, m_user_agent.c_str());
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
-    curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 0L);
+    // Accept-Encoding: use protocol option if set, otherwise default to "identity"
+    if (!m_custom_accept_encoding.empty())
+        curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, m_custom_accept_encoding.c_str());
+    else
+        curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
+    // Referer: apply protocol option header (match Kodi CurlFile behavior)
+    if (!m_referer.empty())
+    {
+        curl_easy_setopt(curl, CURLOPT_REFERER, m_referer.c_str());
+        curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 0L);
+    }
+    else
+    {
+        curl_easy_setopt(curl, CURLOPT_REFERER, NULL);
+        curl_easy_setopt(curl, CURLOPT_AUTOREFERER, 0L);
+    }
+    // Fail on error: mirror Kodi's semantics (false = don't fail, which is curl default)
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, m_fail_on_error ? 1L : 0L);
+    // Custom HTTP headers from unknown protocol options
+    if (m_custom_header_list)
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, m_custom_header_list);
+    // Custom HTTP method from 'customrequest' protocol option (matches CurlFile behavior)
+    if (!m_custom_request.empty())
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, m_custom_request.c_str());
     curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
     curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, DebugCallback);
 
@@ -1633,16 +1958,42 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
         }
     }
 
+    // --- HTTP Auth ---
+    // Priority: protocol option 'auth' > URL username-based BASIC > default ANY
     if (!m_username.empty() && should_send_auth)
     {
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
         curl_easy_setopt(curl, CURLOPT_USERNAME, m_username.c_str());
         curl_easy_setopt(curl, CURLOPT_PASSWORD, m_password.c_str());
     }
-    else
+
+    bool auth_set = false;
+    if (!m_httpauth.empty())
     {
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
+        auth_set = true;
+        if (m_httpauth == "any")
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
+        else if (m_httpauth == "anysafe")
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_ANYSAFE);
+        else if (m_httpauth == "digest")
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_DIGEST);
+        else if (m_httpauth == "ntlm")
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_NTLM);
+        else if (m_httpauth == "basic")
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+        else
+            auth_set = false;
     }
+    if (!auth_set)
+    {
+        if (!m_username.empty() && should_send_auth)
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+        else
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
+    }
+
+    // Cookie header from protocol option
+    if (!m_cookie.empty())
+        curl_easy_setopt(curl, CURLOPT_COOKIE, m_cookie.c_str());
 
     // [Fix] Allow sending credentials to redirected hosts (necessary when redirecting from Proxy to NAS with auth in URL)
     // curl_easy_setopt(curl, CURLOPT_UNRESTRICTED_AUTH, 1L);
@@ -1701,13 +2052,21 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
         }
     }
 
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-    // [Fix] Allow all redirect
-    curl_easy_setopt(curl, CURLOPT_POSTREDIR, CURL_REDIR_POST_ALL); 
+    // SSL verification — default on, protocol option 'verifypeer=false' can disable
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, m_verify_peer ? 1L : 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, m_verify_peer ? 2L : 0L);
+    // SSL cipher list from protocol option
+    if (!m_cipherlist.empty())
+        curl_easy_setopt(curl, CURLOPT_SSL_CIPHER_LIST, m_cipherlist.c_str());
 
-    // Network & Timeouts
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, m_net_connect_timeout_sec);
+    // Redirects — protocol option 'redirect-limit' overrides default (5)
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, m_redirect_limit >= 0 ? m_redirect_limit : 5L);
+    curl_easy_setopt(curl, CURLOPT_POSTREDIR, CURL_REDIR_POST_ALL);
+
+    // Network & Timeouts — protocol option 'connection-timeout' overrides default
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,
+        m_connect_timeout_override > 0 ? m_connect_timeout_override : m_net_connect_timeout_sec);
     
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 15L);
@@ -2340,7 +2699,9 @@ bool CCurlBuffer::OpenForWrite(const kodi::addon::VFSUrl &url, bool overWrite)
     m_file_url = url.GetURL();
     kodi::Log(ADDON_LOG_INFO, "FastVFS: OpenForWrite() URL=%s, OverWrite=%d", m_file_url.c_str(), overWrite);
 
-    // URL 清理: 去掉 Kodi 的 '|' 参数
+    // Parse protocol options then strip them from URL
+    ParseProtocolOptions(m_file_url);
+
     size_t pipe_pos = m_file_url.find('|');
     if (pipe_pos != std::string::npos)
         m_file_url = m_file_url.substr(0, pipe_pos);
@@ -2470,5 +2831,4 @@ int CCurlBuffer::Truncate(int64_t size)
     // HTTP/WebDAV 不支持 Truncate, 与 Kodi CurlFile 行为一致
     return -1;
 }
-
 

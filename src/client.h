@@ -3,6 +3,14 @@
 #include <kodi/addon-instance/VFS.h>
 #include "CurlBuffer.h"
 
+#ifdef CreateDirectory
+#undef CreateDirectory
+#endif
+
+#ifdef RemoveDirectory
+#undef RemoveDirectory
+#endif
+
 // ---------------------------------------------------------------------------
 // CClientVFS: 插件主入口
 // ---------------------------------------------------------------------------
@@ -37,9 +45,24 @@ public:
   int Stat(const kodi::addon::VFSUrl& url, kodi::vfs::FileStatus& buffer) override;
   
   bool Exists(const kodi::addon::VFSUrl& url) override;
+
+  bool Delete(const kodi::addon::VFSUrl& url) override;
+
+  bool Rename(const kodi::addon::VFSUrl& url, const kodi::addon::VFSUrl& url2) override;
+
+  bool DirectoryExists(const kodi::addon::VFSUrl& url) override;
+
+  bool RemoveDirectory(const kodi::addon::VFSUrl& url) override;
+
+  bool CreateDirectory(const kodi::addon::VFSUrl& url) override;
   
-  // 必须返回 true，否则播放器可能会禁用进度条拖动
-  bool IoControlGetSeekPossible(kodi::addon::VFSFileHandle context) override { return true; }
+  bool IoControlGetSeekPossible(kodi::addon::VFSFileHandle context) override {
+    // Always return true for manifest-type files like MPD.  The seekable=0
+    // protocol option applies to the video stream, not the manifest itself.
+    // Returning false here causes inputstream.adaptive to reject the stream
+    // before even attempting to download the manifest.
+    return true;
+  }
   
   int GetChunkSize(kodi::addon::VFSFileHandle context) override {
     CCurlBuffer* buf = (CCurlBuffer*)context;

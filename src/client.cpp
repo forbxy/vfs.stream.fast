@@ -327,6 +327,36 @@ bool CClientVFS::Exists(const kodi::addon::VFSUrl &url)
     return Stat(url, status) == 0;
 }
 
+bool CClientVFS::Delete(const kodi::addon::VFSUrl& url)
+{
+    CCurlBuffer file;
+    return file.DeleteUrl(url);
+}
+
+bool CClientVFS::Rename(const kodi::addon::VFSUrl& url, const kodi::addon::VFSUrl& url2)
+{
+    CCurlBuffer file;
+    return file.RenameUrl(url, url2);
+}
+
+bool CClientVFS::DirectoryExists(const kodi::addon::VFSUrl& url)
+{
+    CCurlBuffer file;
+    return file.DirectoryExistsUrl(url);
+}
+
+bool CClientVFS::RemoveDirectory(const kodi::addon::VFSUrl& url)
+{
+    CCurlBuffer file;
+    return file.RemoveDirectoryUrl(url);
+}
+
+bool CClientVFS::CreateDirectory(const kodi::addon::VFSUrl& url)
+{
+    CCurlBuffer file;
+    return file.CreateDirectoryUrl(url);
+}
+
 kodi::addon::VFSFileHandle CClientVFS::OpenForWrite(const kodi::addon::VFSUrl &url, bool overWrite)
 {
     std::string safeUrl = url.GetRedacted();

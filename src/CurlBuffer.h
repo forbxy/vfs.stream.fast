@@ -31,12 +31,18 @@ public:
     bool OpenForWrite(const kodi::addon::VFSUrl &url, bool overWrite);
     ssize_t Write(const uint8_t *buffer, size_t size);
     int Truncate(int64_t size);
+    bool DeleteUrl(const kodi::addon::VFSUrl& url);
+    bool RenameUrl(const kodi::addon::VFSUrl& url, const kodi::addon::VFSUrl& url2);
+    bool DirectoryExistsUrl(const kodi::addon::VFSUrl& url);
+    bool RemoveDirectoryUrl(const kodi::addon::VFSUrl& url);
+    bool CreateDirectoryUrl(const kodi::addon::VFSUrl& url);
 
     int64_t GetPosition() const { return m_logical_position; }
     int64_t GetLength() const { return m_total_size; }
     
     // Metadata getters
     bool IsRangeSupported() const { return m_support_range; }
+    bool IsSeekable() const { return m_seekable; }
     bool IsDirectory() const { return m_is_directory; }
     time_t GetModificationTime() const { return m_mod_time; }
     time_t GetAccessTime() const { return m_access_time; }
@@ -120,8 +126,15 @@ protected:
     void SetupDownloadRangeOptions(CURL* curl, const std::string& target_url, int64_t start, int64_t length);
     void SetupWorkerDownloadOptions(CURL* curl, const std::string& target_url, int64_t start);
 
+    // Kodi URL protocol options parsing (after '|')
+    void ParseProtocolOptions(const std::string& original_url);
+    static std::string UrlDecode(const std::string& encoded);
+
     void UpdateEffectiveUrlFromCurl(CURL* curl, const std::string& original_url, const char* context_name);
     static std::string GetFileExtensionFromUrl(const std::string& url); // [New] Get Extension Helper
+    bool ExecuteSimpleRequest(const kodi::addon::VFSUrl& url,
+                              const char* method,
+                              const std::vector<std::string>& headers = {});
 
     // 写入模式回调 (curl READFUNCTION, 向服务器上传数据)
     static size_t UploadReadCallback(char *buffer, size_t size, size_t nitems, void *userp);
@@ -134,6 +147,20 @@ private:
     std::string m_username;
     std::string m_password;
     std::string m_user_agent; // Cached at construction, never changes
+
+    // Kodi URL protocol options (parsed from '|' suffix, matches CurlFile support)
+    std::string m_referer;
+    std::string m_custom_accept_encoding;
+    std::string m_httpauth;             // HTTP auth method (any/anysafe/digest/ntlm/basic)
+    std::string m_cookie;               // HTTP Cookie header
+    std::string m_cipherlist;           // SSL cipher list
+    std::string m_custom_request;       // customrequest protocol option (CURLOPT_CUSTOMREQUEST)
+    long m_connect_timeout_override = 0; // connection-timeout (0 = use default m_net_connect_timeout_sec)
+    long m_redirect_limit = -1;         // redirect-limit (-1 = use curl default)
+    bool m_seekable = true;
+    bool m_fail_on_error = false;
+    bool m_verify_peer = true;
+    struct curl_slist* m_custom_header_list = nullptr;
 
     int64_t m_total_size = 0;                     // 文件总大小
     int64_t m_logical_position = 0;               // Kodi 认为的播放位置
@@ -165,6 +192,7 @@ private:
 
     // ----- 写入模式状态 (Write Mode State) -----
     bool m_for_write = false;
+    bool m_closed = false;     // 防止 Close() 被重复调用
     bool m_write_error = false;
     bool m_write_eof = false;
     CURL* m_write_curl = nullptr;
