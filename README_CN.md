@@ -76,5 +76,5 @@ cmake --build . --config Release
 
 ## 许可证
 
-本软件采用 [GNU General Public License v2+ (GPL-2.0-or-later)](LICENSE.txt) 授权，与 Kodi 项目保持一致。
+本软件采用 [GNU General Public License v2+ (GPL-2.0-or-later)](LICENSE.txt) 授权，与 Kodi 项目保持一致。 
 
