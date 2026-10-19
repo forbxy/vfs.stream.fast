@@ -1,15 +1,45 @@
 name: Build VFS Addon
 
-on: [push, pull_request]
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
+  validate:
+    name: Validate packaging and tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test packaging
+        run: python -m unittest discover -s dev -p 'test_*.py' -v
+      - name: Check tag version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: python
+        run: |
+          import os
+          import xml.etree.ElementTree as ET
+          version = ET.parse('addon.xml').getroot().attrib['version']
+          tag = os.environ['GITHUB_REF_NAME']
+          assert tag in (version, f'v{version}'), f'Tag {tag} does not match addon.xml {version}'
+
   build:
-    name: Build ${{ matrix.os }}-${{ matrix.arch }}
-    runs-on: ${{ matrix.runs-on }}
+    needs: validate
+    name: Build ${{ matrix.kodi }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
+    runs-on: ${{ matrix.platform.runs-on }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        kodi: [Omega, Piers]
+        platform:
           # --- Android (Cross Compile) ---
           - os: android
             arch: aarch64
@@ -82,7 +112,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: xbmc/xbmc
-          ref: Omega  # 建议改为 Omega (Kodi 21) 以获得最佳兼容性
+          ref: ${{ matrix.kodi }}
           path: kodi_src
           fetch-depth: 1
 
@@ -95,17 +125,17 @@ jobs:
 
       # 3. 安装依赖 (Linux 基础环境)
       - name: Install Linux Build Tools
-        if: matrix.os == 'linux'
+        if: matrix.platform.os == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake g++ pkg-config build-essential
-          if [ "${{ matrix.arch }}" == "i686" ]; then
+          if [ "${{ matrix.platform.arch }}" == "i686" ]; then
             sudo apt-get install -y gcc-multilib g++-multilib
           fi
-          if [ "${{ matrix.arch }}" == "aarch64" ]; then
+          if [ "${{ matrix.platform.arch }}" == "aarch64" ]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           fi
-          if [ "${{ matrix.arch }}" == "armv7" ]; then
+          if [ "${{ matrix.platform.arch }}" == "armv7" ]; then
             sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
           fi
 
@@ -116,69 +146,89 @@ jobs:
         run: |
           cmake -B build -S . \
             -DCMAKE_TOOLCHAIN_FILE=vcpkg/scripts/buildsystems/vcpkg.cmake \
-            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
-            -DKODI_SOURCE_DIR=kodi_src \
-            ${{ matrix.cmake-args }}
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.platform.triplet }} \
+            -DKODI_SOURCE_DIR="${GITHUB_WORKSPACE}/kodi_src" \
+            -DCMAKE_BUILD_TYPE=Release \
+            ${{ matrix.platform.cmake-args }}
           cmake --build build --config Release --parallel
 
-      # 5. 编译 (Linux 原生) - REMOVED (Merged into Step 4)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-      # 6. 打包文件 (整理输出)
-      - name: Prepare Artifacts
+      - name: Package Addon
+        id: package
         shell: bash
+        env:
+          BUILD_OS: ${{ matrix.platform.os }}
+          BUILD_ARCH: ${{ matrix.platform.arch }}
+          KODI_CODENAME: ${{ matrix.kodi }}
         run: |
-          # 提取版本号 (排除第一行的 xml version)
-          # 使用 grep -v '<?xml' 过滤掉文件头，防止匹配到 xml 的版本 1.0
-          VERSION=$(grep 'version="' addon.xml | grep -v '<?xml' | head -1 | sed -n 's/.*version="\([^"]*\)".*/\1/p')
-          echo "Detected version: $VERSION"
-          
-          ADDON_ID="vfs.stream.fast"
-          mkdir -p $ADDON_ID
-          
-          # 复制 addon.xml
-          cp addon.xml $ADDON_ID/
-
-          # 复制 icon
-          cp icon.png $ADDON_ID/
-
-          # 复制 resources 目录
-          cp -r resources $ADDON_ID/
-
-          # ------------------------------------------------------------------
-          # 动态修改 addon.xml 中的平台标识 (Platform) - 已禁用
-          # 保持 <platform>all</platform>，避免在某些系统(如CE)上因平台标识不匹配导致无法安装
-          # ------------------------------------------------------------------
-          
-          # 复制并重命名二进制文件 (Kodi 需要特定的文件名)
-          if [ "${{ matrix.os }}" == "windows" ]; then
-            find build -name "*.dll" -exec cp {} $ADDON_ID/$ADDON_ID.dll \;
-          elif [ "${{ matrix.os }}" == "macos" ]; then
-            find build -name "*.dylib" -exec cp {} $ADDON_ID/$ADDON_ID.dylib \;
-          else
-            # Linux/Android 通常是 libvfs.stream.fast.so
-            find build -name "*.so" -exec cp {} $ADDON_ID/lib$ADDON_ID.so \;
+          PLATFORM="$BUILD_OS-$BUILD_ARCH"
+          if [ "$BUILD_OS" = "macos" ]; then
+            PLATFORM="osx-$BUILD_ARCH"
           fi
-          
-          # 准备上传目录 (避免二次压缩)
-          # 将最终文件夹移动到 staging 目录，这样 upload-artifact 上传 staging 时会自动将该文件夹放在 zip 根目录
-          mkdir -p staging
-          mv $ADDON_ID staging/
-          
-          # 导出版本号供下一步骤使用
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          TAG_ARGS=()
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG_ARGS=(--tag "$GITHUB_REF_NAME")
+          fi
+          python dev/package_addon.py \
+            --kodi-source kodi_src \
+            --kodi "$KODI_CODENAME" \
+            --platform "$PLATFORM" \
+            "${TAG_ARGS[@]}"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
-        if: matrix.os != 'macos'
         with:
-          # 最终产物名称: vfs.stream.fast-1.0.0-windows-x86_64
-          name: vfs.stream.fast-${{ env.VERSION }}-${{ matrix.os }}-${{ matrix.arch }}
-          path: staging/
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0
 
-      - name: Upload Artifacts (macOS)
-        uses: actions/upload-artifact@v4
-        if: matrix.os == 'macos'
+  release:
+    name: Publish Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v4
         with:
-          # macOS 特殊命名: vfs.stream.fast-1.0.0-osx-arm64 / osx-x86_64
-          name: vfs.stream.fast-${{ env.VERSION }}-osx-${{ matrix.arch }}
-          path: staging/
+          pattern: vfs.stream.fast-*
+          path: release
+          merge-multiple: true
+
+      - name: Verify release packages
+        shell: python
+        run: |
+          from pathlib import Path
+          import zipfile
+          packages = list(Path('release').glob('*.zip'))
+          platforms = ('android-aarch64', 'android-armv7', 'windows-x86_64',
+                       'windows-i686', 'osx-x86_64', 'osx-arm64', 'linux-x86_64',
+                       'linux-i686', 'linux-aarch64', 'linux-armv7')
+          expected = {f'-{kodi}-{platform}.zip'
+                      for kodi in ('Omega', 'Piers') for platform in platforms}
+          assert len(packages) == len(expected), f'Expected 20 packages, got {len(packages)}'
+          for suffix in expected:
+              assert sum(p.name.endswith(suffix) for p in packages) == 1, suffix
+          for package in packages:
+              with zipfile.ZipFile(package) as archive:
+                  assert archive.testzip() is None, package
+                  assert 'vfs.stream.fast/addon.xml' in archive.namelist(), package
+
+      - name: Publish tag release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" release/*.zip --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG_NAME" release/*.zip \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$TAG_NAME"
+          fi

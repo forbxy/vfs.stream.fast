@@ -14,14 +14,32 @@ Builds available for Windows (x64, x86), Linux (x64, x86, ARM64, ARM), Android (
 ## Installation
 
 1. Go to the [Releases](../../releases) page.
-2. Download the zip file matching your platform (CoreELEC ng: `linux-armv7`, ne: `linux-aarch64`; other platforms match your Kodi version).
+2. Download the ZIP matching both your Kodi version and platform: Kodi 21 → `Omega`, Kodi 22 → `Piers`; CoreELEC ng → `linux-armv7`, ne → `linux-aarch64`.
 3. In Kodi, navigate to **Settings** -> **Add-ons** -> **Install from zip file**.
 4. Select the downloaded zip file.
 5. The addon provides block cache size and read-ahead settings. Default values should work out of the box.
 
 Also available via the [repository.forbxy](https://github.com/forbxy/repository.forbxy) repository (recommended, auto-matches your OS and Kodi version).
 
-For Kodi 22 builds (before official release), download from [Actions #24951229291](https://github.com/forbxy/vfs.stream.fast/actions/runs/24951229291).
+Package names include the Kodi codename between the add-on version and platform, for example:
+
+- `vfs.stream.fast-1.3.2-Omega-linux-armv7.zip`
+- `vfs.stream.fast-1.3.2-Piers-linux-armv7.zip`
+
+Kodi 22 alpha/beta/RC releases also use `Piers`. Install repository version **1.3.0 or later** for automatic Kodi matching.
+
+## GitHub Actions and releases
+
+Each push, pull request, or manual run builds all 10 platforms against both Kodi branches: `xbmc/xbmc:Omega` for Kodi 21 and `xbmc/xbmc:Piers` for Kodi 22. Actions artifacts contain the installable ZIP; extract the artifact download once before installing that ZIP in Kodi.
+
+Pushing a tag automatically publishes a GitHub Release with all **20 ZIPs**, after every build succeeds. The tag must match the version in `addon.xml`, optionally prefixed with `v`:
+
+```bash
+git tag v1.3.2
+git push origin v1.3.2
+```
+
+Update `addon.xml` before tagging a new version. Ordinary branch builds do not publish releases. Re-running a successful tag run replaces its existing release assets. Packaged XML takes binary API requirements from the selected SDK and declares its supported Kodi range.
 
 ## Build from Source
 
@@ -32,7 +50,7 @@ This project uses CMake and vcpkg for dependency management.
 - CMake
 - [vcpkg](https://github.com/microsoft/vcpkg)
 - C++ Compiler (MSVC, GCC, Clang)
-- **Kodi Source Code** (checkout the branch matching your target version, e.g. `Omega` for 21.x)
+- **Kodi Source Code** (checkout the branch matching your target version, `Omega` for 21.x or `Piers` for 22.x)
 
 ### Build Instructions (Windows)
 

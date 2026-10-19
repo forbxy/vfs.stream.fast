@@ -14,7 +14,7 @@
 ## 安装
 
 1. 前往 [Releases](../../releases) 页面。
-2. 下载对应您平台的 zip 文件（coreelec ng分支:linux-alinux-armv7,ne分支linux-aarch64,其他平台和安装的kodi版本保持一致即可）。
+2. 同时按 Kodi 版本和平台选择 ZIP：Kodi 21 选 `Omega`，Kodi 22 选 `Piers`；CoreELEC ng 分支选 `linux-armv7`，ne 分支选 `linux-aarch64`。
 3. 在 Kodi 中，导航至 **设置** -> **插件** -> **从 zip 文件安装**。
 4. 选择下载的 zip 文件。
 5. 设置中提供了一些关于块缓存大小和预读缓存等设置，一般情况下，安装即可加速，无需调整设置
@@ -22,7 +22,25 @@
 也可通过 [repository.forbxy](https://github.com/forbxy/repository.forbxy) 仓库安装，详细信息见仓库项目主页。  
 仓库安装会自动匹配操作系统和kodi，推荐  
 
-适配kodi 22的插件在22正式发行之前从actions中下载安装 [action:24951229291](https://github.com/forbxy/vfs.stream.fast/actions/runs/24951229291)
+安装包在版本号和平台之间加入 Kodi 代号，例如：
+
+- `vfs.stream.fast-1.3.2-Omega-linux-armv7.zip`
+- `vfs.stream.fast-1.3.2-Piers-linux-armv7.zip`
+
+Kodi 22 的 alpha、beta、RC 版本同样选择 `Piers`。仓库自动匹配需要安装 **1.3.0 或更高版本**的仓库插件。
+
+## GitHub Actions 与自动发布
+
+每次 push、pull request 或手动运行，都会构建两套各 10 个平台的安装包：Kodi 21 使用 `xbmc/xbmc` 的 `Omega` 分支，Kodi 22 使用 `Piers` 分支。Actions 的 artifact 内含可安装 ZIP，下载后先解压 artifact，再将里面的 ZIP 交给 Kodi 安装。
+
+推送 tag 时，全部构建成功后自动创建 GitHub Release，并上传 **20 个 ZIP**。tag 必须与 `addon.xml` 中的版本一致，可带 `v` 前缀：
+
+```bash
+git tag v1.3.2
+git push origin v1.3.2
+```
+
+发布新版本前先修改 `addon.xml`。普通分支构建不发布 Release；重新运行 tag 构建会替换该 Release 的同名附件。安装包中的二进制 API 依赖从相应 Kodi SDK 读取，并声明兼容的 Kodi 版本范围。
 
 
 ## 源码编译
@@ -34,7 +52,7 @@
 - CMake
 - [vcpkg](https://github.com/microsoft/vcpkg)
 - C++ Compiler (MSVC, GCC, Clang)
-- **Kodi 源码** (切到对应版本的分支:例如21.x: `Omega`)
+- **Kodi 源码** (切到对应版本的分支:21.x: `Omega`，22.x: `Piers`)
 
 ### 编译说明 (Windows)
 
