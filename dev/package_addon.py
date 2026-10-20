@@ -38,10 +38,18 @@ def prepare_manifest(source, sdk, codename, tag=None):
         match = re.search(rf'^#define\s+{macro}\s+"([^"]+)"', sdk_versions, re.MULTILINE)
         if not match:
             raise ValueError(f"Missing {macro} in {headers}")
+        # Use the SDK's compatible minimum, not its current API version.
+        # Piers API 2.0.4 supports 2.0.3; requiring 2.0.4 in XML would hide
+        # this compatible binary on Kodi 22 beta systems.
+        minimum_match = re.search(
+            rf'^#define\s+{macro}_MIN\s+"([^"]+)"', sdk_versions, re.MULTILINE)
+        api_version = minimum_match.group(1) if minimum_match else match.group(1)
+        if tuple(map(int, api_version.split('.'))) > tuple(map(int, match.group(1).split('.'))):
+            raise ValueError(f"{macro}_MIN exceeds {macro} in {headers}")
         dependency = requires.find(f"import[@addon='{addon}']")
         if dependency is None:
             dependency = ET.SubElement(requires, "import", addon=addon)
-        dependency.set("version", match.group(1))
+        dependency.set("version", api_version)
 
     dependency = requires.find("import[@addon='xbmc.addon']")
     if dependency is None:
