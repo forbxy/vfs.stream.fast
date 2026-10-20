@@ -4,7 +4,7 @@ import unittest
 import xml.etree.ElementTree as ET
 import zipfile
 
-from package_addon import package_addon
+from package_addon import package_addon, prepare_manifest
 
 
 class PackageTests(unittest.TestCase):
@@ -25,14 +25,17 @@ class PackageTests(unittest.TestCase):
         headers = sdk / 'xbmc/addons/kodi-dev-kit/include/kodi/versions.h'
         headers.parent.mkdir(parents=True, exist_ok=True)
         main = '2.0.2' if codename == 'Omega' else '2.0.4'
+        minimum = '2.0.2' if codename == 'Omega' else '2.0.3'
         headers.write_text(f'#define ADDON_GLOBAL_VERSION_MAIN "{main}"\n'
-                           '#define ADDON_INSTANCE_VERSION_VFS "3.0.1"\n')
+                           f'#define ADDON_GLOBAL_VERSION_MAIN_MIN "{minimum}"\n'
+                           '#define ADDON_INSTANCE_VERSION_VFS "3.0.1"\n'
+                           '#define ADDON_INSTANCE_VERSION_VFS_MIN "3.0.1"\n', encoding='utf-8')
         return package_addon(self.source, sdk, codename, platform, self.build,
                              self.base / 'dist', tag)
 
     def test_dual_packages_have_own_sdk_requirements_and_installable_layout(self):
         version = ET.parse(self.source / 'addon.xml').getroot().get('version')
-        for codename, main in (('Omega', '2.0.2'), ('Piers', '2.0.4')):
+        for codename, main in (('Omega', '2.0.2'), ('Piers', '2.0.3')):
             with self.subTest(kodi=codename):
                 package = self.package(codename, f'v{version}')
                 self.assertEqual(package.name, f'vfs.stream.fast-{version}-{codename}-linux-armv7.zip')
@@ -45,6 +48,26 @@ class PackageTests(unittest.TestCase):
                     self.assertEqual(root.find("requires/import[@addon='kodi.binary.global.main']").get('version'), main)
                     minimum = root.find("requires/import[@addon='xbmc.addon']").get('version')
                     self.assertEqual(minimum, '21.0.0' if codename == 'Omega' else '21.90.1')
+
+    def test_sdk_without_minimum_keeps_current_api_requirement(self):
+        self.package('Piers')
+        sdk = self.base / 'Piers'
+        headers = sdk / 'xbmc/addons/kodi-dev-kit/include/kodi/versions.h'
+        headers.write_text('#define ADDON_GLOBAL_VERSION_MAIN "2.0.4"\n'
+                           '#define ADDON_INSTANCE_VERSION_VFS "3.0.1"\n', encoding='utf-8')
+        root = prepare_manifest(self.source, sdk, 'Piers')
+        self.assertEqual(root.find("requires/import[@addon='kodi.binary.global.main']").get('version'),
+                         '2.0.4')
+
+    def test_invalid_sdk_minimum_is_rejected(self):
+        self.package('Piers')
+        sdk = self.base / 'Piers'
+        headers = sdk / 'xbmc/addons/kodi-dev-kit/include/kodi/versions.h'
+        text = headers.read_text(encoding='utf-8').replace(
+            'ADDON_GLOBAL_VERSION_MAIN_MIN "2.0.3"', 'ADDON_GLOBAL_VERSION_MAIN_MIN "2.0.5"')
+        headers.write_text(text, encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'MIN exceeds'):
+            prepare_manifest(self.source, sdk, 'Piers')
 
     def test_wrong_tag_does_not_publish_a_misversioned_package(self):
         with self.assertRaisesRegex(ValueError, 'must match'):
